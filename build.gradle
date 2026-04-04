@@ -18,6 +18,7 @@ repositories {
 
 dependencies {
     implementation 'org.apache.pdfbox:pdfbox:3.0.3'
+    implementation 'org.apache.pdfbox:jbig2-imageio:3.0.4'
     implementation 'org.apache.poi:poi-ooxml:5.3.0'
     implementation 'com.fasterxml.jackson.core:jackson-databind:2.17.2'
     implementation 'info.picocli:picocli:4.7.6'

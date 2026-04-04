@@ -12,6 +12,7 @@ import java.awt.image.BufferedImage;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -33,6 +34,18 @@ import java.util.List;
 public class PDFPreprocessor {
 
     private final ColumnAwareTextStripper columnDetector = new ColumnAwareTextStripper();
+
+    private final com.dnd.processor.config.DnD_BasicSet config;
+
+    /** Uses default D&D Basic Set tuning. */
+    public PDFPreprocessor() {
+        this(new com.dnd.processor.config.DnD_BasicSet());
+    }
+
+    /** Uses the supplied module config for all projection-analysis tuning. */
+    public PDFPreprocessor(com.dnd.processor.config.DnD_BasicSet config) {
+        this.config = config;
+    }
 
     /**
      * Renders every page of the PDF as a PNG image and writes them to {@code outputDir}.
@@ -90,7 +103,7 @@ public class PDFPreprocessor {
             Files.createDirectories(debugDir);
         }
 
-        ProjectionAnalyzer analyzer = new ProjectionAnalyzer();
+        ProjectionAnalyzer analyzer = new ProjectionAnalyzer(config);
 
         try (PDDocument source = Loader.loadPDF(inputPath.toFile());
              PDDocument output = new PDDocument()) {
@@ -100,9 +113,13 @@ public class PDFPreprocessor {
             int digits    = String.valueOf(pageCount).length();
             String base   = stripExtension(inputPath.getFileName().toString());
 
+            float[] minM = {Float.MAX_VALUE, Float.MAX_VALUE, Float.MAX_VALUE, Float.MAX_VALUE};
+            float[] maxM = {0, 0, 0, 0};
+            int excluded = 0;
+
             for (int i = 0; i < pageCount; i++) {
                 BufferedImage img    = renderer.renderImageWithDPI(i, dpi, ImageType.RGB);
-                ProjectionAnalyzer.PageLayout layout = analyzer.analyzeLayout(img);
+                ProjectionAnalyzer.PageLayout layout = withCoverOverride(analyzer.analyzeLayout(img), i, pageCount);
 
                 int imgW = img.getWidth();
                 int imgH = img.getHeight();
@@ -142,12 +159,35 @@ public class PDFPreprocessor {
                     ImageIO.write(annotated, "PNG", debugDir.resolve(fname).toFile());
                 }
 
-                System.out.printf("  page %d/%d  %s%n", i + 1, pageCount, layout.type());
+                {
+                    float tIn = m.top()             / dpi;
+                    float bIn = (imgH - m.bottom()) / dpi;
+                    float lIn = m.left()            / dpi;
+                    float rIn = (imgW - m.right())  / dpi;
+                    boolean excludeFromSummary = isFullPageLayout(layout.type());
+                    if (excludeFromSummary) {
+                        excluded++;
+                    } else {
+                        minM[0] = Math.min(minM[0], tIn); maxM[0] = Math.max(maxM[0], tIn);
+                        minM[1] = Math.min(minM[1], bIn); maxM[1] = Math.max(maxM[1], bIn);
+                        minM[2] = Math.min(minM[2], lIn); maxM[2] = Math.max(maxM[2], lIn);
+                        minM[3] = Math.min(minM[3], rIn); maxM[3] = Math.max(maxM[3], rIn);
+                    }
+                    System.out.printf("  page %d/%d  %-14s  margins=[T:%.2f B:%.2f L:%.2f R:%.2f]%s%n",
+                            i + 1, pageCount, layout.type(), tIn, bIn, lIn, rIn,
+                            excludeFromSummary ? " (excluded)" : "");
+                }
             }
 
             output.save(outputPath.toFile());
             System.out.printf("Layout complete: %d source pages → %d sub-pages%n",
                     pageCount, output.getNumberOfPages());
+            int included = pageCount - excluded;
+            System.out.printf("Margin summary (%d pages, %d excluded, inches at %.0f DPI):%n", included, excluded, dpi);
+            System.out.printf("  top:    min=%.2f  max=%.2f%n", minM[0], maxM[0]);
+            System.out.printf("  bottom: min=%.2f  max=%.2f%n", minM[1], maxM[1]);
+            System.out.printf("  left:   min=%.2f  max=%.2f%n", minM[2], maxM[2]);
+            System.out.printf("  right:  min=%.2f  max=%.2f%n", minM[3], maxM[3]);
         }
     }
 
@@ -191,22 +231,87 @@ public class PDFPreprocessor {
      * No files are written; this is a diagnostic step.
      */
     public void classifyPages(Path inputPath, float dpi) throws IOException {
-        ProjectionAnalyzer analyzer = new ProjectionAnalyzer();
+        ProjectionAnalyzer analyzer = new ProjectionAnalyzer(config);
 
         try (PDDocument doc = Loader.loadPDF(inputPath.toFile())) {
             PDFRenderer renderer = new PDFRenderer(doc);
             int pageCount = doc.getNumberOfPages();
 
+            float[] minM = {Float.MAX_VALUE, Float.MAX_VALUE, Float.MAX_VALUE, Float.MAX_VALUE};
+            float[] maxM = {0, 0, 0, 0};
+            int excluded = 0;
+
             for (int i = 0; i < pageCount; i++) {
                 BufferedImage page = renderer.renderImageWithDPI(i, dpi, ImageType.RGB);
-                ProjectionAnalyzer.PageLayout layout = analyzer.analyzeLayout(page);
-                System.out.printf("  page %2d/%d  %-14s  zones=%-20s  splitX=%-6s  splitY=%-6s%n",
+                ProjectionAnalyzer.PageLayout layout = withCoverOverride(analyzer.analyzeLayout(page), i, pageCount);
+                ProjectionAnalyzer.Margins m = layout.margins();
+                int imgW = page.getWidth(), imgH = page.getHeight();
+                float tIn = m.top()              / dpi;
+                float bIn = (imgH - m.bottom())  / dpi;
+                float lIn = m.left()             / dpi;
+                float rIn = (imgW - m.right())   / dpi;
+                boolean excludeFromSummary = isFullPageLayout(layout.type()) || isFullBleed(m, imgW, imgH);
+                if (excludeFromSummary) {
+                    excluded++;
+                } else {
+                    minM[0] = Math.min(minM[0], tIn); maxM[0] = Math.max(maxM[0], tIn);
+                    minM[1] = Math.min(minM[1], bIn); maxM[1] = Math.max(maxM[1], bIn);
+                    minM[2] = Math.min(minM[2], lIn); maxM[2] = Math.max(maxM[2], lIn);
+                    minM[3] = Math.min(minM[3], rIn); maxM[3] = Math.max(maxM[3], rIn);
+                }
+                System.out.printf("  page %2d/%d  %-14s  margins=[T:%.2f B:%.2f L:%.2f R:%.2f]%s  zones=%-20s  splitX=%-6s  splitY=%-6s%n",
                         i + 1, pageCount,
                         layout.type(),
+                        tIn, bIn, lIn, rIn,
+                        excludeFromSummary ? " (excluded)" : "           ",
                         fmtZones(layout.zones()),
                         fmtSplit(layout.splitX(), layout.splitX2()),
                         fmtSplit(layout.splitY(), layout.splitY2()));
             }
+            int included = pageCount - excluded;
+            System.out.printf("%nMargin summary (%d pages, %d excluded, inches at %.0f DPI):%n", included, excluded, dpi);
+            System.out.printf("  top:    min=%.2f  max=%.2f%n", minM[0], maxM[0]);
+            System.out.printf("  bottom: min=%.2f  max=%.2f%n", minM[1], maxM[1]);
+            System.out.printf("  left:   min=%.2f  max=%.2f%n", minM[2], maxM[2]);
+            System.out.printf("  right:  min=%.2f  max=%.2f%n", minM[3], maxM[3]);
+        }
+    }
+
+    /**
+     * Processes every page and prints only the pages whose layout is not cleanly
+     * TWO_COLUMN. Useful for verifying that a two-column module is being read correctly
+     * and for spotting pages that need special handling (maps, tables, covers, etc.).
+     *
+     * @param inputPath source PDF file
+     * @param dpi       render resolution
+     */
+    public void verifyColumns(Path inputPath, float dpi) throws IOException {
+        ProjectionAnalyzer analyzer = new ProjectionAnalyzer(config);
+
+        try (PDDocument doc = Loader.loadPDF(inputPath.toFile())) {
+            PDFRenderer renderer = new PDFRenderer(doc);
+            int pageCount = doc.getNumberOfPages();
+            int digits    = String.valueOf(pageCount).length();
+            int flagged   = 0;
+
+            System.out.printf("Verifying two-column layout: %s  (%d pages)%n%n",
+                    inputPath.getFileName(), pageCount);
+
+            for (int i = 0; i < pageCount; i++) {
+                BufferedImage img = renderer.renderImageWithDPI(i, dpi, ImageType.RGB);
+                ProjectionAnalyzer.PageLayout layout = withCoverOverride(analyzer.analyzeLayout(img), i, pageCount);
+                ProjectionAnalyzer.LayoutType type   = layout.type();
+
+                if (type == ProjectionAnalyzer.LayoutType.TWO_COLUMN) continue;
+
+                flagged++;
+                String zones = fmtZones(layout.zones());
+                String splitX = fmtSplit(layout.splitX(), layout.splitX2());
+                System.out.printf("  page %0" + digits + "d  %-14s  zones=%-22s  splitX=%s%n",
+                        i + 1, type, zones, splitX);
+            }
+
+            System.out.printf("%n%d / %d pages are not TWO_COLUMN%n", flagged, pageCount);
         }
     }
 
@@ -224,7 +329,7 @@ public class PDFPreprocessor {
     public void analyzeBands(Path inputPath, Path outputDir, float dpi) throws IOException {
         Files.createDirectories(outputDir);
         String baseName = stripExtension(inputPath.getFileName().toString());
-        ProjectionAnalyzer analyzer = new ProjectionAnalyzer();
+        ProjectionAnalyzer analyzer = new ProjectionAnalyzer(config);
 
         try (PDDocument doc = Loader.loadPDF(inputPath.toFile())) {
             PDFRenderer renderer = new PDFRenderer(doc);
@@ -320,6 +425,223 @@ public class PDFPreprocessor {
     private static String stripExtension(String fileName) {
         int dot = fileName.lastIndexOf('.');
         return dot > 0 ? fileName.substring(0, dot) : fileName;
+    }
+
+    /**
+     * Detects tables on every page and writes annotated PNG images to {@code outputDir}.
+     * Pages with no detected tables are skipped.
+     * Orange solid border = rule-based (high confidence).
+     * Orange dashed border = implicit (lower confidence).
+     * Cyan = detected rule line. Blue = detected title region.
+     */
+    public void detectTables(Path inputPath, Path outputDir, float dpi) throws IOException {
+        Files.createDirectories(outputDir);
+        String baseName = stripExtension(inputPath.getFileName().toString());
+
+        ProjectionAnalyzer analyzer  = new ProjectionAnalyzer(config);
+        TableDetector      detector  = new TableDetector();
+        TableClassifier    classifier = new TableClassifier();
+
+        try (PDDocument doc = Loader.loadPDF(inputPath.toFile())) {
+            PDFRenderer renderer = new PDFRenderer(doc);
+            int pageCount = doc.getNumberOfPages();
+            int digits    = String.valueOf(pageCount).length();
+
+            int pagesWritten = 0;
+            for (int i = 0; i < pageCount; i++) {
+                BufferedImage img    = renderer.renderImageWithDPI(i, dpi, ImageType.RGB);
+                ProjectionAnalyzer.PageLayout layout = withCoverOverride(analyzer.analyzeLayout(img), i, pageCount);
+                ProjectionAnalyzer.Margins margins   = layout.margins();
+
+                List<TableRegion> raw       = detector.detect(img, layout, doc, i, dpi);
+                List<TableRegion> classified = new java.util.ArrayList<>();
+                for (TableRegion r : raw) {
+                    classified.add(classifier.classify(r, doc, i, img.getWidth(), img.getHeight(), dpi));
+                }
+
+                if (classified.isEmpty()) continue;
+
+                BufferedImage annotated = annotateTablePage(img, classified);
+                String fname = String.format("%s-page-%0" + digits + "d-tables.png", baseName, i + 1);
+                javax.imageio.ImageIO.write(annotated, "PNG", outputDir.resolve(fname).toFile());
+                pagesWritten++;
+
+                for (TableRegion r : classified) {
+                    System.out.printf("  page %d/%d  %-28s  %s%n",
+                            i + 1, pageCount,
+                            r.type(),
+                            r.title().isEmpty() ? "(no title)" : "\"" + r.title() + "\"");
+                }
+            }
+            System.out.printf("Table detection complete: %d pages with tables written to %s%n",
+                    pagesWritten, outputDir);
+        }
+    }
+
+    private BufferedImage annotateTablePage(BufferedImage src, List<TableRegion> regions) {
+        java.awt.Color orange = new java.awt.Color(255, 140, 0);
+        java.awt.Color cyan   = new java.awt.Color(0, 200, 220);
+        java.awt.Color blue   = new java.awt.Color(50, 100, 255);
+        java.awt.Color white  = java.awt.Color.WHITE;
+
+        BufferedImage out = new BufferedImage(src.getWidth(), src.getHeight(), BufferedImage.TYPE_INT_RGB);
+        java.awt.Graphics2D g = out.createGraphics();
+        g.drawImage(src, 0, 0, null);
+        g.setRenderingHint(java.awt.RenderingHints.KEY_ANTIALIASING,
+                java.awt.RenderingHints.VALUE_ANTIALIAS_ON);
+
+        java.awt.Font labelFont = new java.awt.Font("SansSerif", java.awt.Font.BOLD, 11);
+        g.setFont(labelFont);
+
+        for (TableRegion r : regions) {
+            int x = r.xLeft(), w = r.xRight() - r.xLeft();
+            int y = r.yTop(),  h = r.yBottom() - r.yTop();
+
+            // Table region border
+            g.setColor(orange);
+            if (r.implicit()) {
+                float[] dash = {6f, 4f};
+                g.setStroke(new java.awt.BasicStroke(2f, java.awt.BasicStroke.CAP_BUTT,
+                        java.awt.BasicStroke.JOIN_MITER, 10f, dash, 0f));
+            } else {
+                g.setStroke(new java.awt.BasicStroke(2f));
+            }
+            g.drawRect(x, y, w, h);
+
+            // Rule line (cyan)
+            if (r.hasRule()) {
+                g.setColor(cyan);
+                g.setStroke(new java.awt.BasicStroke(1f));
+                g.drawRect(x, r.ruleYTop(), w, r.ruleYBottom() - r.ruleYTop());
+            }
+
+            // Title region (blue)
+            if (r.hasTitle()) {
+                g.setColor(blue);
+                g.setStroke(new java.awt.BasicStroke(1f));
+                g.drawRect(x, r.titleYTop(), w, r.titleYBottom() - r.titleYTop());
+            }
+
+            // Label bar at top of table region
+            String label = r.type().name().replace('_', ' ');
+            java.awt.FontMetrics fm = g.getFontMetrics();
+            int barH  = fm.getHeight() + 4;
+            int barY  = Math.max(0, y - barH);
+            int textX = x + 4;
+            int textY = barY + fm.getAscent() + 2;
+
+            g.setStroke(new java.awt.BasicStroke(1f));
+            g.setColor(orange);
+            g.fillRect(x, barY, w, barH);
+            g.setColor(white);
+            g.drawString(label, textX, textY);
+        }
+
+        g.dispose();
+        return out;
+    }
+
+    /** Returns true for layout types that represent full-page images (excluded from margin summary). */
+    /**
+     * Overrides the layout type for the first and last pages of a document to
+     * FRONT_COVER / BACK_COVER regardless of what the analyzer detected.
+     */
+    private static ProjectionAnalyzer.PageLayout withCoverOverride(
+            ProjectionAnalyzer.PageLayout layout, int pageIndex, int pageCount) {
+        ProjectionAnalyzer.LayoutType type = layout.type();
+        if (pageIndex == 0)             type = ProjectionAnalyzer.LayoutType.FRONT_COVER;
+        else if (pageIndex == pageCount - 1) type = ProjectionAnalyzer.LayoutType.BACK_COVER;
+        if (type == layout.type()) return layout;
+        return new ProjectionAnalyzer.PageLayout(type, layout.margins(), layout.zones(),
+                layout.splitX(), layout.splitX2(), layout.splitY(), layout.splitY2(),
+                layout.vertGaps(), layout.horizGaps());
+    }
+
+    private static boolean isFullPageLayout(ProjectionAnalyzer.LayoutType type) {
+        return type == ProjectionAnalyzer.LayoutType.MAP
+            || type == ProjectionAnalyzer.LayoutType.FRONT_COVER
+            || type == ProjectionAnalyzer.LayoutType.BACK_COVER;
+    }
+
+    /** Returns true if the detected content area covers ≥ 98% of the page (full-bleed image or border frame). */
+    private static boolean isFullBleed(ProjectionAnalyzer.Margins m, int imgW, int imgH) {
+        float contentArea = (float)(m.right() - m.left()) * (m.bottom() - m.top());
+        float pageArea    = (float) imgW * imgH;
+        return pageArea > 0 && contentArea / pageArea >= 0.98f;
+    }
+
+    /**
+     * Analyses margins for every page and returns one {@link PageMarginInfo} per page.
+     * Prints per-page lines and a per-file summary to stdout.
+     * Full-page layout types (MAP, COVER, BACK_COVER) and full-bleed pages are flagged
+     * and excluded from the summary statistics.
+     */
+    public List<PageMarginInfo> analyzeMargins(Path inputPath, float dpi) throws IOException {
+        List<PageMarginInfo> results = new ArrayList<>();
+        ProjectionAnalyzer analyzer = new ProjectionAnalyzer(config);
+
+        try (PDDocument doc = Loader.loadPDF(inputPath.toFile())) {
+            PDFRenderer renderer = new PDFRenderer(doc);
+            int pageCount = doc.getNumberOfPages();
+
+            float[] minM = {Float.MAX_VALUE, Float.MAX_VALUE, Float.MAX_VALUE, Float.MAX_VALUE};
+            float[] maxM = {0, 0, 0, 0};
+            float[] sumM = {0, 0, 0, 0};
+            int included = 0, excluded = 0;
+
+            System.out.printf("%nFile: %s (%d pages)%n", inputPath.getFileName(), pageCount);
+
+            for (int i = 0; i < pageCount; i++) {
+                BufferedImage img = renderer.renderImageWithDPI(i, dpi, ImageType.RGB);
+                ProjectionAnalyzer.PageLayout layout = withCoverOverride(analyzer.analyzeLayout(img), i, pageCount);
+                ProjectionAnalyzer.Margins m = layout.margins();
+                int imgW = img.getWidth(), imgH = img.getHeight();
+
+                float tIn = m.top()             / dpi;
+                float bIn = (imgH - m.bottom()) / dpi;
+                float lIn = m.left()            / dpi;
+                float rIn = (imgW - m.right())  / dpi;
+                boolean fullBleed = isFullBleed(m, imgW, imgH);
+
+                PageMarginInfo info = new PageMarginInfo(i + 1, layout.type(), fullBleed, tIn, bIn, lIn, rIn);
+                results.add(info);
+
+                String note;
+                if (isFullPageLayout(layout.type())) {
+                    note = " (excluded - " + layout.type().name().toLowerCase() + ")";
+                    excluded++;
+                } else if (fullBleed) {
+                    note = " (excluded - full-bleed)";
+                    excluded++;
+                } else {
+                    note = "";
+                    included++;
+                    minM[0] = Math.min(minM[0], tIn); maxM[0] = Math.max(maxM[0], tIn); sumM[0] += tIn;
+                    minM[1] = Math.min(minM[1], bIn); maxM[1] = Math.max(maxM[1], bIn); sumM[1] += bIn;
+                    minM[2] = Math.min(minM[2], lIn); maxM[2] = Math.max(maxM[2], lIn); sumM[2] += lIn;
+                    minM[3] = Math.min(minM[3], rIn); maxM[3] = Math.max(maxM[3], rIn); sumM[3] += rIn;
+                }
+                System.out.printf("  page %2d/%d  %-14s  [T:%.2f B:%.2f L:%.2f R:%.2f]%s%n",
+                        i + 1, pageCount, layout.type(), tIn, bIn, lIn, rIn, note);
+            }
+
+            printMarginSummary(inputPath.getFileName().toString(), included, excluded, dpi, minM, maxM, sumM);
+        }
+        return results;
+    }
+
+    public static void printMarginSummary(String label, int included, int excluded, float dpi,
+                                           float[] minM, float[] maxM, float[] sumM) {
+        System.out.printf("  Margin summary: %s (%d pages included, %d excluded, inches at %.0f DPI)%n",
+                label, included, excluded, dpi);
+        if (included == 0) {
+            System.out.println("    (no included pages)");
+            return;
+        }
+        System.out.printf("    top:    min=%.2f  avg=%.2f  max=%.2f%n", minM[0], sumM[0] / included, maxM[0]);
+        System.out.printf("    bottom: min=%.2f  avg=%.2f  max=%.2f%n", minM[1], sumM[1] / included, maxM[1]);
+        System.out.printf("    left:   min=%.2f  avg=%.2f  max=%.2f%n", minM[2], sumM[2] / included, maxM[2]);
+        System.out.printf("    right:  min=%.2f  avg=%.2f  max=%.2f%n", minM[3], sumM[3] / included, maxM[3]);
     }
 
     /**

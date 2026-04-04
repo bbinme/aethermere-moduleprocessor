@@ -35,105 +35,72 @@ import java.util.List;
  */
 public class ProjectionAnalyzer {
 
-    // ── Tuning constants (all pixel values assume 150 DPI) ────────────────────
+    // ── Config (all pixel values assume 150 DPI) ──────────────────────────────
 
-    // A pixel is "ink" if its grayscale value is below this
-    private static final int INK_THRESHOLD = 200;
+    private final int   INK_THRESHOLD;
+    private final float MAX_INK_FRACTION;
+    private final float MAX_COLUMN_GAP_INK_FRACTION;
+    private final int   MIN_VERT_GAP_PX;
+    private final int   MIN_HORIZ_GAP_PX;
+    private final float MIN_COLUMN_FRACTION;
+    private final float MAX_INK_DENSITY_RATIO;
+    private final float MAX_BRIDGE_DENSITY_FRACTION;
+    private final int   MIN_INK_FOR_CONTENT;
+    private final int   FOOTER_CLUSTER_MAX_PX;
+    private final int   FOOTER_FIRST_GAP_MIN_PX;
+    private final int   FOOTER_CONTENT_GAP_MIN_PX;
+    private final int   FOOTER_EXTRA_CLUSTER_MAX_PX;
+    private final int   FOOTER_EXTRA_PASSES;
+    private final int   FOOTER_TINY_CLUSTER_MAX_PX;
+    private final int   MIN_ROW_SPLIT_PX;
+    private final int   MIN_TABLE_HORIZ_GAPS;
+    private final float MIN_MAP_INK_FRACTION;
+    private final int   MAX_MAP_HORIZ_GAPS;
+    private final int   MAX_MAP_VERT_GAPS;
+    private final float MAP_IMAGE_ZONE_FRACTION;
+    private final float FULL_PAGE_ILLUSTRATION_FRACTION;
+    private final float ILLUSTRATION_INK_FRACTION;
+    private final int   MIN_ILLUSTRATION_PX;
 
-    // A row/column qualifies as "empty" if its ink count ≤ this fraction of
-    // the perpendicular dimension.  0.5 % tolerates stray pixels / noise.
-    private static final float MAX_INK_FRACTION = 0.005f;
+    /** Uses default D&D Basic Set tuning. */
+    public ProjectionAnalyzer() {
+        this(new com.dnd.processor.config.DnD_BasicSet());
+    }
 
-    // Minimum gap sizes inside the content area
-    private static final int MIN_VERT_GAP_PX  = 10;   // column gutter  (~0.07 in)
-    private static final int MIN_HORIZ_GAP_PX =  5;   // blank line gap (~0.03 in)
-
-    // A vertical gap is only a column gutter if both sub-columns on either side
-    // are at least this fraction of the total content width.
-    private static final float MIN_COLUMN_FRACTION = 0.25f;
-
-    // If one sub-column has more than this many times the ink density of the
-    // other, the gap is an indent: the sparse side is just numbering / bullets.
-    private static final float MAX_INK_DENSITY_RATIO = 5.0f;
-
-    // Sparse-bridge merge: if the strip of text between two adjacent gaps has
-    // ink density below this fraction of the sparser real column on either side,
-    // it is treated as a label strip (section headings, bullets) and the two
-    // gaps are merged into one wider gutter.
-    private static final float MAX_BRIDGE_DENSITY_FRACTION = 0.3f;
-
-    // Margin detection: a row/column must exceed this ink count to be "content"
-    private static final int MIN_INK_FOR_CONTENT = 3;
-
-    // Footer isolation: a cluster at the bottom with height ≤ this is treated
-    // as a footer element and absorbed into the bottom margin.
-    // 150 px (~1 in at 150 DPI) covers thick decorative borders in D&D Basic modules.
-    private static final int FOOTER_CLUSTER_MAX_PX = 150;  // ~1.0 in
-
-    // The gap between the bottom cluster and the next element above it must be at
-    // least this many rows to confirm there really is a footer zone worth scanning.
-    // This prevents treating normal inter-line paragraph spacing as a footer gap.
-    private static final int FOOTER_FIRST_GAP_MIN_PX = 15;  // ~0.10 in at 150 DPI
-
-    // When iterating upward through the footer zone, the gap between one footer
-    // element (ornament, page number) and the next must be at least this large to
-    // be accepted as the final content boundary.  Smaller gaps are treated as
-    // inter-element spacing within the footer zone and absorbed.
-    private static final int FOOTER_CONTENT_GAP_MIN_PX = 15; // ~0.10 in at 150 DPI
-
-    // Each extra footer element (page number, ornamental rule) absorbed above the
-    // initial cluster must be ≤ this height.  Taller clusters are real content.
-    private static final int FOOTER_EXTRA_CLUSTER_MAX_PX = 35;  // ~0.23 in at 150 DPI
-    private static final int FOOTER_EXTRA_PASSES = 3;
-
-    // Clusters at or below this height are treated as noise/fragment rows (e.g.
-    // descender tips, scattered pixels of the page number).  They are absorbed
-    // unconditionally as long as any gap exists above them.  Taller clusters (real
-    // page-number glyphs, ornamental rules) are only absorbed when a large gap
-    // (≥ FOOTER_CONTENT_GAP_MIN_PX) confirms the content boundary lies above them.
-    private static final int FOOTER_TINY_CLUSTER_MAX_PX = 5;
-
-    // A horizontal gap must be at least this tall to qualify as a page-level
-    // row divider (TWO_ROW / TWO_BY_TWO).  Ordinary section breaks between
-    // paragraphs are typically 5–25 px; genuine row dividers are wider.
-    private static final int MIN_ROW_SPLIT_PX = 20;         // ~0.13 in
-
-    // TABLE detection: a page with this many horizontal gaps and no column gutters
-    // is treated as a table rather than multi-row text.
-    private static final int MIN_TABLE_HORIZ_GAPS = 10;
-
-    // MAP detection: a page whose content area has ink density above this fraction
-    // and very few horizontal gaps is treated as a map / full-page illustration.
-    private static final float MIN_MAP_INK_FRACTION = 0.20f;
-    private static final int   MAX_MAP_HORIZ_GAPS   = 3;
-    // MAP may have at most this many vertical gaps (e.g. a legend/key column)
-    private static final int   MAX_MAP_VERT_GAPS    = 1;
-    // Alternate MAP path: if full-width IMAGE zones cover this fraction of the
-    // content height AND ink density is high, classify as MAP even if there are
-    // surrounding text zones (e.g. dungeon map with title heading + legend).
-    private static final float MAP_IMAGE_ZONE_FRACTION = 0.50f;
-
-    // Pass 0 — full-width illustration zone detection.
-    // A row qualifies as full-width dense only when BOTH the left half AND the right
-    // half of the content area each exceed this fraction of the half-width.
-    // Half-page (column-only) illustrations have ink in only one half and fail.
-    private static final float FULL_PAGE_ILLUSTRATION_FRACTION = 0.15f;
-
-    // Pass 1.5 — column-scoped illustration detection.
-    // A row within a column must exceed this fraction of the COLUMN width.
-    // Text rows are well below 5 %; illustrations are typically 20–80 %.
-    private static final float ILLUSTRATION_INK_FRACTION = 0.15f;
-
-    // A contiguous run of dense rows must be at least this tall to be treated
-    // as an illustration zone (filters out single rule-lines and table borders).
-    private static final int   MIN_ILLUSTRATION_PX = 80;   // ~0.5 in at 150 DPI
+    /** Uses the supplied module config for all tuning constants. */
+    public ProjectionAnalyzer(com.dnd.processor.config.DnD_BasicSet config) {
+        INK_THRESHOLD                  = config.inkThreshold();
+        MAX_INK_FRACTION               = config.maxInkFraction();
+        MAX_COLUMN_GAP_INK_FRACTION    = config.maxColumnGapInkFraction();
+        MIN_VERT_GAP_PX                = config.minVertGapPx();
+        MIN_HORIZ_GAP_PX               = config.minHorizGapPx();
+        MIN_COLUMN_FRACTION            = config.minColumnFraction();
+        MAX_INK_DENSITY_RATIO          = config.maxInkDensityRatio();
+        MAX_BRIDGE_DENSITY_FRACTION    = config.maxBridgeDensityFraction();
+        MIN_INK_FOR_CONTENT            = config.minInkForContent();
+        FOOTER_CLUSTER_MAX_PX          = config.footerClusterMaxPx();
+        FOOTER_FIRST_GAP_MIN_PX        = config.footerFirstGapMinPx();
+        FOOTER_CONTENT_GAP_MIN_PX      = config.footerContentGapMinPx();
+        FOOTER_EXTRA_CLUSTER_MAX_PX    = config.footerExtraClusterMaxPx();
+        FOOTER_EXTRA_PASSES            = config.footerExtraPasses();
+        FOOTER_TINY_CLUSTER_MAX_PX     = config.footerTinyClusterMaxPx();
+        MIN_ROW_SPLIT_PX               = config.minRowSplitPx();
+        MIN_TABLE_HORIZ_GAPS           = config.minTableHorizGaps();
+        MIN_MAP_INK_FRACTION           = config.minMapInkFraction();
+        MAX_MAP_HORIZ_GAPS             = config.maxMapHorizGaps();
+        MAX_MAP_VERT_GAPS              = config.maxMapVertGaps();
+        MAP_IMAGE_ZONE_FRACTION        = config.mapImageZoneFraction();
+        FULL_PAGE_ILLUSTRATION_FRACTION = config.fullPageIllustrationFraction();
+        ILLUSTRATION_INK_FRACTION      = config.illustrationInkFraction();
+        MIN_ILLUSTRATION_PX            = config.minIllustrationPx();
+    }
 
     // ── Public API ────────────────────────────────────────────────────────────
 
     /** Detected margin boundaries (pixel coordinates). */
     public record Margins(int top, int bottom, int left, int right) {}
 
-    public enum LayoutType { SINGLE, MAP, TABLE, TWO_COLUMN, THREE_COLUMN, TWO_ROW, THREE_ROW, TWO_BY_TWO }
+    public enum LayoutType { SINGLE, MAP, TABLE, TWO_COLUMN, THREE_COLUMN, TWO_ROW, THREE_ROW, TWO_BY_TWO, FRONT_COVER, BACK_COVER }
 
     /** Whether a zone contains typeset text or an illustration/map. */
     public enum ZoneType { TEXT, IMAGE }
@@ -266,10 +233,18 @@ public class ProjectionAnalyzer {
         // Alternate MAP path: large central IMAGE zone (dungeon map + title + legend).
         // The title and legend create text zones with column gaps that break the primary
         // path, but the IMAGE zone still dominates the content area.
+        // Guard: skip if text zones collectively occupy ≥ 30% of the content height —
+        // that indicates a real layout page (text + illustration) rather than a map
+        // with small legend/title labels.
         long totalImageHeight = 0;
-        for (Zone z : zones) if (z.type() == ZoneType.IMAGE) totalImageHeight += z.yBottom() - z.yTop();
+        long totalTextHeight  = 0;
+        for (Zone z : zones) {
+            if (z.type() == ZoneType.IMAGE) totalImageHeight += z.yBottom() - z.yTop();
+            else                            totalTextHeight  += z.yBottom() - z.yTop();
+        }
         int contentHeight = m.bottom() - m.top();
         if (highInkDensity && contentHeight > 0
+                && (float) totalTextHeight  / contentHeight < 0.30f
                 && (float) totalImageHeight / contentHeight >= MAP_IMAGE_ZONE_FRACTION) {
             return new PageLayout(LayoutType.MAP, m, zones,
                     splitX, splitX2, splitY, splitY2, allVertGaps, allHorizGaps);
@@ -471,13 +446,34 @@ public class ProjectionAnalyzer {
      */
     private Zone buildTextZone(boolean[] ink, int w, int h, Margins m,
                                 int yTop, int yBottom) {
-        // Pass 1: find column gutters in this zone only
+        // Pass 1: find column gutters in this zone only.
+        // Uses the more tolerant MAX_COLUMN_GAP_INK_FRACTION (3%) instead of
+        // MAX_INK_FRACTION (0.5%) — column gutters adjacent to illustrations or
+        // below full-width headings have stray ink from edge bleed / heading text
+        // that exceeds the strict threshold but is far below real content density.
         int[] vertProjZone = verticalProjection(ink, w, h, yTop, yBottom);
-        int   maxInkPerCol = Math.max(1, (int)((yBottom - yTop) * MAX_INK_FRACTION));
+        int   maxInkPerCol = Math.max(1, (int)((yBottom - yTop) * MAX_COLUMN_GAP_INK_FRACTION));
 
         List<int[]> vGaps = findGaps(vertProjZone, m.left(), m.right(), maxInkPerCol, MIN_VERT_GAP_PX);
         vGaps = filterIndentGaps(vGaps, m.left(), m.right(), vertProjZone);
         vGaps = mergeSparseBridges(vGaps, vertProjZone, m.left(), m.right());
+
+        // Pass 1b (header fallback): if no gaps were found, a full-width header spanning
+        // the column gutter (e.g. a centered box title) may have injected ink into the
+        // gutter x-columns, causing them to exceed maxInkPerCol.  Re-try using only the
+        // bottom 80% of the zone — the header ink is concentrated at the top, so the
+        // body-only projection typically shows a clean gap.
+        if (vGaps.isEmpty()) {
+            int topSkip  = (int)((yBottom - yTop) * 0.20f);
+            int bodyStart = yTop + topSkip;
+            if (bodyStart < yBottom) {
+                int[] vertProjBody = verticalProjection(ink, w, h, bodyStart, yBottom);
+                int   maxInkBody   = Math.max(1, (int)((yBottom - bodyStart) * MAX_COLUMN_GAP_INK_FRACTION));
+                vGaps = findGaps(vertProjBody, m.left(), m.right(), maxInkBody, MIN_VERT_GAP_PX);
+                vGaps = filterIndentGaps(vGaps, m.left(), m.right(), vertProjBody);
+                vGaps = mergeSparseBridges(vGaps, vertProjBody, m.left(), m.right());
+            }
+        }
 
         // Derive column x-ranges from gap boundaries
         List<int[]> colRanges = new ArrayList<>();
@@ -515,6 +511,30 @@ public class ProjectionAnalyzer {
             if (cur < yBottom) {
                 List<int[]> hGaps = findGaps(horizProjCol, cur, yBottom, maxInkPerRow, MIN_HORIZ_GAP_PX);
                 subZones.add(new ColumnZone(cur, yBottom, ZoneType.TEXT, hGaps));
+            }
+
+            // Post-process column sub-zones: merge IMAGE + thin_TEXT + IMAGE into a single
+            // IMAGE sub-zone.  A sparse interior band in a pen-and-ink illustration can dip
+            // below the density threshold, splitting one illustration into two IMAGE sub-zones
+            // with a thin TEXT gap between them.  Each sub-zone becomes its own sub-page in
+            // the layout PDF, producing a horizontal cut through the image.
+            // Mirror the same merge logic that buildZones applies to page-level IMAGE zones.
+            int si = subZones.size() - 1;
+            while (si >= 2) {
+                ColumnZone sz   = subZones.get(si);
+                ColumnZone mid  = subZones.get(si - 1);
+                ColumnZone czPrev = subZones.get(si - 2);
+                if (sz.type() == ZoneType.IMAGE
+                        && mid.type() == ZoneType.TEXT
+                        && czPrev.type() == ZoneType.IMAGE
+                        && mid.yBottom() - mid.yTop() < MIN_ILLUSTRATION_PX) {
+                    subZones.set(si - 2, new ColumnZone(czPrev.yTop(), sz.yBottom(), ZoneType.IMAGE, List.of()));
+                    subZones.remove(si);
+                    subZones.remove(si - 1);
+                    si -= 2;
+                } else {
+                    si--;
+                }
             }
 
             columns.add(new Column(colLeft, colRight, subZones));
@@ -565,8 +585,8 @@ public class ProjectionAnalyzer {
         }
         if (numText >= 3 && imageZones.isEmpty()) return LayoutType.THREE_ROW;
 
-        // Mix of text and image zones
-        if (maxCols >= 2) return LayoutType.TWO_BY_TWO;  // column text + image
+        // Mix of text and image zones — zone count == row count (zones are horizontal bands)
+        if (numAll >= 3) return LayoutType.THREE_ROW;
         return LayoutType.TWO_ROW;
     }
 

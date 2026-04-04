@@ -310,7 +310,7 @@ public class ColumnAwareTextStripper {
         float pageWidth  = page.getMediaBox().getWidth();
         float pageHeight = page.getMediaBox().getHeight();
         List<TextRun> runs = captureRuns(doc, pageIndex);
-        List<Zone> zones   = detectZones(runs, pageWidth, pageHeight);
+        List<Zone> zones   = detectZones(runs, pageWidth, pageHeight, 0);
         for (Zone z : zones) {
             if (z.layout() == BandLayout.TWO_COL || z.layout() == BandLayout.THREE_COL) {
                 return z.gap1();   // first column gutter x
@@ -341,7 +341,7 @@ public class ColumnAwareTextStripper {
         if (docBoundaryHint <= 0) {
             text = extractSingleColumnPage(doc, zeroBasedPageIndex);
         } else {
-            List<Zone> zones = detectZones(runs, pageWidth, pageHeight);
+            List<Zone> zones = detectZones(runs, pageWidth, pageHeight, docBoundaryHint);
             boolean anyMultiCol = zones.stream().anyMatch(z -> z.layout() != BandLayout.SINGLE);
 
             if (!anyMultiCol) {
@@ -409,7 +409,7 @@ public class ColumnAwareTextStripper {
         List<TextRun> runs = captureRuns(doc, zeroBasedPageIndex);
         if (runs.isEmpty()) return "";
 
-        List<Zone> zones = detectZones(runs, pageWidth, pageHeight);
+        List<Zone> zones = detectZones(runs, pageWidth, pageHeight, 0);
 
         StringBuilder sb = new StringBuilder();
         for (Zone zone : zones) {
@@ -466,7 +466,8 @@ public class ColumnAwareTextStripper {
      */
     private List<Rectangle2D> pageBoxes  = Collections.emptyList(); // populated by captureRuns
 
-    private List<Zone> detectZones(List<TextRun> runs, float pageWidth, float pageHeight) {
+    private List<Zone> detectZones(List<TextRun> runs, float pageWidth, float pageHeight,
+                                   float docBoundaryHint) {
         int hw = (int) Math.ceil(pageWidth) + 1;
 
         // ------------------------------------------------------------------
@@ -494,6 +495,18 @@ public class ColumnAwareTextStripper {
         if (allGaps.isEmpty()) {
             allGaps = findAllGaps(fullHist, pageWidth,
                     COL_SCAN_START, COL_SCAN_END, 4, MAIN_GAP_MIN_WIDTH);
+        }
+
+        // Hint fallback: if Stage 1 found nothing (e.g. a centered full-width title
+        // filled the gutter bins), try the document-level column boundary.  Accept it
+        // only when the right column has text that reaches across the page — prevents
+        // false positives on pages that are genuinely single-column.
+        if (allGaps.isEmpty() && docBoundaryHint > 0) {
+            float rightReachHint = 0;
+            for (TextRun r : runs) if (r.x() > docBoundaryHint) rightReachHint = Math.max(rightReachHint, r.x());
+            if (rightReachHint >= pageWidth * RIGHT_REACH_MIN) {
+                allGaps = List.of(docBoundaryHint);
+            }
         }
 
         if (allGaps.isEmpty()) {
@@ -721,6 +734,19 @@ public class ColumnAwareTextStripper {
                     && colCoverage < 0.65f) {
                 leftSidebarW = bestLValleyX;
             }
+        }
+
+        // Detect a full-width header above the two-column body (mirrors THREE_COL logic).
+        // Pass mainGap as both g1 and g2: fullWidthHeaderEnd treats any character within
+        // ±15 pt of the gutter as a "gutter char".  A centered title (e.g. "Players'
+        // Background") has characters that straddle the column gutter; body text in the
+        // two columns does not.
+        float headerEndY = fullWidthHeaderEnd(runs, mainGap, mainGap);
+        if (headerEndY > 0) {
+            return List.of(
+                new Zone(0,           headerEndY, BandLayout.SINGLE,  -1,      -1,          0),
+                new Zone(headerEndY,  pageHeight, BandLayout.TWO_COL, mainGap, rightColEndX, leftSidebarW)
+            );
         }
 
         return List.of(new Zone(0, pageHeight, BandLayout.TWO_COL, mainGap, rightColEndX, leftSidebarW));
@@ -1140,13 +1166,13 @@ public class ColumnAwareTextStripper {
     }
 
     private String extractSingleColumnPage(PDDocument doc, int zeroBasedPageIndex) throws IOException {
-        PDFTextStripper stripper = new PDFTextStripper();
-        stripper.setSortByPosition(true);
-        stripper.setStartPage(zeroBasedPageIndex + 1);
-        stripper.setEndPage(zeroBasedPageIndex + 1);
-        StringWriter sw = new StringWriter();
-        stripper.writeText(doc, sw);
-        return sw.toString();
+        // Use PDFTextStripperByArea so we respect the page's cropBox.
+        // A raw PDFTextStripper reads the full content stream — text that has been
+        // visually cropped out (e.g. footer page numbers in layout sub-pages) still
+        // appears in the output.  Clipping to the cropBox prevents that bleed.
+        PDPage page = doc.getPage(zeroBasedPageIndex);
+        PDRectangle crop = page.getCropBox();
+        return extractRegion(page, 0, 0, crop.getWidth(), crop.getHeight());
     }
 
     /**
