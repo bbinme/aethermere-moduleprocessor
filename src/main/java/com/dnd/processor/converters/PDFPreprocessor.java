@@ -12,6 +12,7 @@ import java.awt.image.BufferedImage;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
 
 /**
  * Splits two-column PDF pages into individual single-column pages.
@@ -113,45 +114,25 @@ public class PDFPreprocessor {
 
                 ProjectionAnalyzer.Margins m = layout.margins();
 
-                // M = margin constant used to pre-adjust split boundaries so that
-                // subBox's expansion cancels out exactly at the split line.
-                // Outer edges (page margins) are expanded normally; shared edges are not.
-                int M = SUB_PAGE_MARGIN_PX;
-                switch (layout.type()) {
-                    case SINGLE, MAP, TABLE -> {
-                        PDPage p = output.importPage(src);
-                        PDRectangle box = subBox(med, imgW, imgH, scaleX, scaleY,
-                                m.left(), m.top(), m.right(), m.bottom());
-                        p.setMediaBox(box); p.setCropBox(box);
-                    }
-                    case TWO_COLUMN -> {
-                        int sx = layout.splitX();
-                        addSubPage(output, source, i, med, imgW, imgH, scaleX, scaleY, m.left(),  m.top(), sx - M,   m.bottom());
-                        addSubPage(output, source, i, med, imgW, imgH, scaleX, scaleY, sx + M,    m.top(), m.right(), m.bottom());
-                    }
-                    case THREE_COLUMN -> {
-                        int sx1 = layout.splitX(), sx2 = layout.splitX2();
-                        addSubPage(output, source, i, med, imgW, imgH, scaleX, scaleY, m.left(),  m.top(), sx1 - M,   m.bottom());
-                        addSubPage(output, source, i, med, imgW, imgH, scaleX, scaleY, sx1 + M,   m.top(), sx2 - M,   m.bottom());
-                        addSubPage(output, source, i, med, imgW, imgH, scaleX, scaleY, sx2 + M,   m.top(), m.right(), m.bottom());
-                    }
-                    case TWO_ROW -> {
-                        int sy = layout.splitY();
-                        addSubPage(output, source, i, med, imgW, imgH, scaleX, scaleY, m.left(), m.top(),  m.right(), sy - M);
-                        addSubPage(output, source, i, med, imgW, imgH, scaleX, scaleY, m.left(), sy + M,   m.right(), m.bottom());
-                    }
-                    case THREE_ROW -> {
-                        int sy1 = layout.splitY(), sy2 = layout.splitY2();
-                        addSubPage(output, source, i, med, imgW, imgH, scaleX, scaleY, m.left(), m.top(),  m.right(), sy1 - M);
-                        addSubPage(output, source, i, med, imgW, imgH, scaleX, scaleY, m.left(), sy1 + M,  m.right(), sy2 - M);
-                        addSubPage(output, source, i, med, imgW, imgH, scaleX, scaleY, m.left(), sy2 + M,  m.right(), m.bottom());
-                    }
-                    case TWO_BY_TWO -> {
-                        int sx = layout.splitX(), sy = layout.splitY();
-                        addSubPage(output, source, i, med, imgW, imgH, scaleX, scaleY, m.left(), m.top(),  sx - M,    sy - M);
-                        addSubPage(output, source, i, med, imgW, imgH, scaleX, scaleY, sx + M,   m.top(),  m.right(), sy - M);
-                        addSubPage(output, source, i, med, imgW, imgH, scaleX, scaleY, m.left(), sy + M,   sx - M,    m.bottom());
-                        addSubPage(output, source, i, med, imgW, imgH, scaleX, scaleY, sx + M,   sy + M,   m.right(), m.bottom());
+                // Iterate over zones top-to-bottom.
+                // Full-width IMAGE zones (Pass 0) become a single full-width sub-page.
+                // TEXT zones are split into columns; within each column, column-scoped
+                // IMAGE sub-zones (Pass 1.5) and TEXT sub-zones each become one sub-page.
+                for (ProjectionAnalyzer.Zone zone : layout.zones()) {
+                    int zt = zone.yTop(), zb = zone.yBottom();
+                    if (zone.type() == ProjectionAnalyzer.ZoneType.IMAGE
+                            || zone.columns().isEmpty()) {
+                        // Full-width IMAGE zone or degenerate text zone
+                        addSubPage(output, source, i, med, imgW, imgH, scaleX, scaleY,
+                                   m.left(), zt, m.right(), zb);
+                    } else {
+                        // One sub-page per column sub-zone
+                        for (ProjectionAnalyzer.Column col : zone.columns()) {
+                            for (ProjectionAnalyzer.ColumnZone cz : col.subZones()) {
+                                addSubPage(output, source, i, med, imgW, imgH, scaleX, scaleY,
+                                           col.xLeft(), cz.yTop(), col.xRight(), cz.yBottom());
+                            }
+                        }
                     }
                 }
 
@@ -219,13 +200,12 @@ public class PDFPreprocessor {
             for (int i = 0; i < pageCount; i++) {
                 BufferedImage page = renderer.renderImageWithDPI(i, dpi, ImageType.RGB);
                 ProjectionAnalyzer.PageLayout layout = analyzer.analyzeLayout(page);
-                System.out.printf("  page %2d/%d  %-14s  splitX=%-10s  splitY=%-10s  vertGaps=%d  horizGaps=%d%n",
+                System.out.printf("  page %2d/%d  %-14s  zones=%-20s  splitX=%-6s  splitY=%-6s%n",
                         i + 1, pageCount,
                         layout.type(),
+                        fmtZones(layout.zones()),
                         fmtSplit(layout.splitX(), layout.splitX2()),
-                        fmtSplit(layout.splitY(), layout.splitY2()),
-                        layout.vertGaps().size(),
-                        layout.horizGaps().size());
+                        fmtSplit(layout.splitY(), layout.splitY2()));
             }
         }
     }
@@ -311,6 +291,25 @@ public class PDFPreprocessor {
                 System.out.printf("  page %d/%d → %s%n", i + 1, pageCount, filename);
             }
         }
+    }
+
+    private static String fmtZones(List<ProjectionAnalyzer.Zone> zones) {
+        StringBuilder sb = new StringBuilder();
+        for (ProjectionAnalyzer.Zone z : zones) {
+            if (sb.length() > 0) sb.append('+');
+            if (z.type() == ProjectionAnalyzer.ZoneType.IMAGE) {
+                sb.append("IMG");
+            } else {
+                long colImgs = z.columns().stream()
+                        .flatMap(c -> c.subZones().stream())
+                        .filter(cz -> cz.type() == ProjectionAnalyzer.ZoneType.IMAGE)
+                        .count();
+                sb.append("T(").append(z.columns().size()).append("col");
+                if (colImgs > 0) sb.append("+").append(colImgs).append("img");
+                sb.append(")");
+            }
+        }
+        return sb.toString();
     }
 
     private static String fmtSplit(int a, int b) {

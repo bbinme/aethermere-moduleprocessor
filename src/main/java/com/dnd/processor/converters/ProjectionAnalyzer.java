@@ -8,18 +8,30 @@ import java.util.List;
 /**
  * Detects white-space structure in a page image using projection profiles.
  *
- * Pass 1 — Margin detection (green rectangle):
+ * Margin detection:
  *   Scan each edge inward until significant ink is found.  The bottom margin
- *   uses an additional "footer isolation" step: if a small isolated ink cluster
- *   (page number) is found near the bottom with a clear gap above it, that
- *   cluster and the gap are absorbed into the bottom margin so they don't
- *   interfere with column gap detection.
+ *   uses a footer-isolation step to absorb page numbers and decorative borders.
  *
- * Pass 2 — Vertical gap detection (red rectangles), inside margins only:
- *   Sum dark pixels per x-column.  Runs of near-empty columns = column gutters.
+ * Pass 0 — Full-width illustration zone detection:
+ *   Rows whose ink count (within the full content width) exceeds
+ *   ILLUSTRATION_INK_FRACTION × content-width are marked as dense.  Contiguous
+ *   dense runs ≥ MIN_ILLUSTRATION_PX are classified as full-width IMAGE zones
+ *   (orange in debug).  The rest of the content area becomes TEXT zones.
  *
- * Pass 3 — Horizontal gap detection (blue rectangles), inside margins only:
- *   Sum dark pixels per y-row.  Runs of near-empty rows = blank lines / breaks.
+ * Pass 1 — Vertical gap detection (column gutters), per TEXT zone:
+ *   For each TEXT zone the vertical projection is computed restricted to that
+ *   zone's rows only, so illustration ink does not bleed into gap detection.
+ *   Surviving gaps become the column boundaries for that zone (red rectangles).
+ *
+ * Pass 1.5 — Column-scoped illustration detection, per column:
+ *   For each column the horizontal projection is restricted to that column's
+ *   x-range.  Rows dense relative to the column width (not the full page width)
+ *   are grouped into column-scoped IMAGE sub-zones (yellow in debug).  This
+ *   catches half-page illustrations that would be too sparse against the full
+ *   content width.
+ *
+ * Pass 2 — Horizontal gap detection (row breaks), per TEXT sub-zone in each column:
+ *   Blank-line gaps within each TEXT sub-zone (blue rectangles).
  */
 public class ProjectionAnalyzer {
 
@@ -96,6 +108,25 @@ public class ProjectionAnalyzer {
     private static final int   MAX_MAP_HORIZ_GAPS   = 3;
     // MAP may have at most this many vertical gaps (e.g. a legend/key column)
     private static final int   MAX_MAP_VERT_GAPS    = 1;
+    // Alternate MAP path: if full-width IMAGE zones cover this fraction of the
+    // content height AND ink density is high, classify as MAP even if there are
+    // surrounding text zones (e.g. dungeon map with title heading + legend).
+    private static final float MAP_IMAGE_ZONE_FRACTION = 0.50f;
+
+    // Pass 0 — full-width illustration zone detection.
+    // A row qualifies as full-width dense only when BOTH the left half AND the right
+    // half of the content area each exceed this fraction of the half-width.
+    // Half-page (column-only) illustrations have ink in only one half and fail.
+    private static final float FULL_PAGE_ILLUSTRATION_FRACTION = 0.15f;
+
+    // Pass 1.5 — column-scoped illustration detection.
+    // A row within a column must exceed this fraction of the COLUMN width.
+    // Text rows are well below 5 %; illustrations are typically 20–80 %.
+    private static final float ILLUSTRATION_INK_FRACTION = 0.15f;
+
+    // A contiguous run of dense rows must be at least this tall to be treated
+    // as an illustration zone (filters out single rule-lines and table borders).
+    private static final int   MIN_ILLUSTRATION_PX = 80;   // ~0.5 in at 150 DPI
 
     // ── Public API ────────────────────────────────────────────────────────────
 
@@ -104,21 +135,49 @@ public class ProjectionAnalyzer {
 
     public enum LayoutType { SINGLE, MAP, TABLE, TWO_COLUMN, THREE_COLUMN, TWO_ROW, THREE_ROW, TWO_BY_TWO }
 
+    /** Whether a zone contains typeset text or an illustration/map. */
+    public enum ZoneType { TEXT, IMAGE }
+
+    /**
+     * A vertical slice within a column: either a text run (with blank-line gaps)
+     * or a column-scoped illustration detected in Pass 1.5.
+     * IMAGE sub-zones have an empty horizGaps list.
+     */
+    public record ColumnZone(int yTop, int yBottom, ZoneType type, List<int[]> horizGaps) {}
+
+    /**
+     * A single column within a TEXT zone: its x-extent and the ordered list of
+     * TEXT/IMAGE sub-zones produced by Pass 1.5 and Pass 2.
+     */
+    public record Column(int xLeft, int xRight, List<ColumnZone> subZones) {}
+
+    /**
+     * A horizontal slice of the content area, either a full-width TEXT zone (with
+     * one or more columns produced by Pass 1) or a full-width IMAGE zone
+     * (illustration/map detected in Pass 0, no column structure).
+     */
+    public record Zone(int yTop, int yBottom, ZoneType type, List<Column> columns) {}
+
     /**
      * Layout classification result for one page image.
      *
-     * @param type    detected layout
+     * {@code zones} is the authoritative structure used for splitting; the
+     * remaining fields are legacy coordinates derived from it for display.
+     *
+     * @param type    summary layout type (display / diagnostics)
      * @param margins content-area boundaries (image pixels)
-     * @param splitX  midpoint of 1st column gutter (-1 if unused)
-     * @param splitX2 midpoint of 2nd column gutter (-1 if unused; THREE_COLUMN only)
-     * @param splitY  midpoint of 1st row divider   (-1 if unused)
-     * @param splitY2 midpoint of 2nd row divider   (-1 if unused; THREE_ROW only)
-     * @param vertGaps  surviving vertical gaps  (image pixel coords)
-     * @param horizGaps all horizontal gaps      (image pixel coords)
+     * @param zones   ordered list of TEXT / IMAGE zones top-to-bottom
+     * @param splitX  midpoint of 1st column gutter in the first TEXT zone (-1 if none)
+     * @param splitX2 midpoint of 2nd column gutter                        (-1 if none)
+     * @param splitY  midpoint of 1st zone boundary                        (-1 if none)
+     * @param splitY2 midpoint of 2nd zone boundary                        (-1 if none)
+     * @param vertGaps  all column gutters across all TEXT zones (for debug drawing)
+     * @param horizGaps all row breaks across all columns          (for debug drawing)
      */
     public record PageLayout(
             LayoutType type,
             Margins margins,
+            List<Zone> zones,
             int splitX,
             int splitX2,
             int splitY,
@@ -139,99 +198,391 @@ public class ProjectionAnalyzer {
         int[]     horizProj = horizontalProjection(ink, w, h);
         Margins   m         = detectMargins(vertProj, horizProj, w, h);
 
-        // Recompute projections restricted to the content area so that headers,
-        // footers, and page numbers don't add ink to the gap regions and skew
-        // column-gutter / row-break detection.
-        int[] vertProjContent  = verticalProjection(ink, w, h, m.top(),  m.bottom());
+        // Horizontal projection restricted to content columns — used for
+        // illustration-zone detection and global MAP ink-density check.
         int[] horizProjContent = horizontalProjection(ink, w, h, m.left(), m.right());
 
-        int maxInkPerCol = Math.max(1, (int)((m.bottom() - m.top())  * MAX_INK_FRACTION));
-        int maxInkPerRow = Math.max(1, (int)((m.right()  - m.left()) * MAX_INK_FRACTION));
+        // ── Pass 0: identify full-width illustration / map zones ──────────────
+        // Bilateral: a row is full-width dense only when BOTH the left half AND
+        // right half each exceed the ink threshold.  Half-page illustrations fail
+        // the bilateral check and fall through to Pass 1.5.
+        int midX = (m.left() + m.right()) / 2;
+        int[] horizProjLeft  = horizontalProjection(ink, w, h, m.left(), midX);
+        int[] horizProjRight = horizontalProjection(ink, w, h, midX, m.right());
+        List<int[]> illZones = findFullWidthIllustrationZones(
+                horizProjLeft, horizProjRight, m.top(), m.bottom(), midX - m.left());
 
-        List<int[]> vertGaps = findGaps(vertProjContent, m.left(), m.right(), maxInkPerCol, MIN_VERT_GAP_PX);
-        vertGaps = filterIndentGaps(vertGaps, m.left(), m.right(), vertProjContent);
-        vertGaps = mergeSparseBridges(vertGaps, vertProjContent, m.left(), m.right());
+        // Partition content area into TEXT and IMAGE zones.
+        // Pass 1 (vertical gap → columns) and Pass 2 (horiz gap per column)
+        // are applied inside buildTextZone for each TEXT zone.
+        List<Zone> zones = buildZones(ink, w, h, m, illZones);
 
-        List<int[]> horizGaps = findGaps(horizProjContent, m.top(), m.bottom(), maxInkPerRow, MIN_HORIZ_GAP_PX);
-
-        // ── Classify ──────────────────────────────────────────────────────────
-
-        // ── Vertical split coordinates ────────────────────────────────────────
-        int numVert = vertGaps.size();
-        int sx1 = numVert >= 1 ? (vertGaps.get(0)[0] + vertGaps.get(0)[1]) / 2 : -1;
-        int sx2 = numVert >= 2 ? (vertGaps.get(1)[0] + vertGaps.get(1)[1]) / 2 : -1;
-
-        // ── Horizontal row-split candidates ──────────────────────────────────
-        int contentHeight = m.bottom() - m.top();
-        int minThird      = (int)(contentHeight * 0.20f);
-        int minHalf       = (int)(contentHeight * 0.30f);
-
-        List<int[]> rowSplits = new ArrayList<>();
-        for (int[] gap : horizGaps)
-            if (gap[1] - gap[0] >= MIN_ROW_SPLIT_PX) rowSplits.add(gap);
-
-        int[] ry1 = null, ry2 = null;
-        outer:
-        for (int a = 0; a < rowSplits.size(); a++) {
-            int[] g1 = rowSplits.get(a);
-            if (g1[0] - m.top() < minThird) continue;
-            if (m.bottom() - g1[1] >= minHalf) {
-                ry1 = g1;
-                for (int b = a + 1; b < rowSplits.size(); b++) {
-                    int[] g2 = rowSplits.get(b);
-                    if (g2[0] - g1[1] >= minThird && m.bottom() - g2[1] >= minThird) {
-                        ry2 = g2;
-                        break outer;
-                    }
-                }
+        // ── Collect legacy gap lists for debug drawing / MAP+TABLE checks ────
+        List<int[]> allVertGaps  = new ArrayList<>();
+        List<int[]> allHorizGaps = new ArrayList<>();
+        for (Zone z : zones) {
+            if (z.type() == ZoneType.TEXT) {
+                List<Column> cols = z.columns();
+                for (int k = 0; k + 1 < cols.size(); k++)
+                    allVertGaps.add(new int[]{cols.get(k).xRight(), cols.get(k + 1).xLeft()});
+                for (Column col : cols)
+                    for (ColumnZone cz : col.subZones())
+                        if (cz.type() == ZoneType.TEXT)
+                            allHorizGaps.addAll(cz.horizGaps());
             }
         }
 
-        int sy1 = ry1 != null ? (ry1[0] + ry1[1]) / 2 : -1;
-        int sy2 = ry2 != null ? (ry2[0] + ry2[1]) / 2 : -1;
+        // ── Legacy split coordinates (from first TEXT zone) ───────────────────
+        int splitX = -1, splitX2 = -1, splitY = -1, splitY2 = -1;
+        List<Zone> textZones  = new ArrayList<>();
+        List<Zone> imageZones = new ArrayList<>();
+        for (Zone z : zones) (z.type() == ZoneType.TEXT ? textZones : imageZones).add(z);
 
-        boolean hasCol  = numVert >= 1;
-        boolean has2Col = numVert >= 2;
-        boolean hasRow  = ry1 != null;
-        boolean has2Row = ry2 != null;
+        if (!textZones.isEmpty()) {
+            List<Column> cols = textZones.get(0).columns();
+            if (cols.size() >= 2) splitX  = (cols.get(0).xRight() + cols.get(1).xLeft()) / 2;
+            if (cols.size() >= 3) splitX2 = (cols.get(1).xRight() + cols.get(2).xLeft()) / 2;
+        }
+        if (zones.size() >= 2) splitY  = (zones.get(0).yBottom() + zones.get(1).yTop()) / 2;
+        if (zones.size() >= 3) splitY2 = (zones.get(1).yBottom() + zones.get(2).yTop()) / 2;
 
-        // ── Split-based classification (checked before MAP/TABLE) ─────────────
-        if (has2Col && has2Row) return new PageLayout(LayoutType.TWO_BY_TWO,  m, sx1, sx2, sy1, sy2, vertGaps, horizGaps);
-        if (has2Col)            return new PageLayout(LayoutType.THREE_COLUMN, m, sx1, sx2,  -1,  -1, vertGaps, horizGaps);
-        if (has2Row)            return new PageLayout(LayoutType.THREE_ROW,    m,  -1,  -1, sy1, sy2, vertGaps, horizGaps);
-        if (hasCol && hasRow)   return new PageLayout(LayoutType.TWO_BY_TWO,   m, sx1,  -1, sy1,  -1, vertGaps, horizGaps);
-        if (hasCol)             return new PageLayout(LayoutType.TWO_COLUMN,   m, sx1,  -1,  -1,  -1, vertGaps, horizGaps);
-        if (hasRow)             return new PageLayout(LayoutType.TWO_ROW,      m,  -1,  -1, sy1,  -1, vertGaps, horizGaps);
-
-        // ── No qualifying splits — check for TABLE and MAP ────────────────────
-        if (horizGaps.size() >= MIN_TABLE_HORIZ_GAPS)
-            return new PageLayout(LayoutType.TABLE, m, -1, -1, -1, -1, vertGaps, horizGaps);
-
+        // ── MAP check: high overall ink density overrides zone classification ──
+        // (handles complex maps with text labels that break illustration runs)
+        int[] vertProjContent = verticalProjection(ink, w, h, m.top(), m.bottom());
         long inkInContent = 0;
-        for (int x = m.left(); x < m.right(); x++) inkInContent += vertProj[x];
+        for (int x = m.left(); x < m.right(); x++) inkInContent += vertProjContent[x];
         long contentArea = (long)(m.right() - m.left()) * (m.bottom() - m.top());
-        if (contentArea > 0
-                && horizGaps.size() <= MAX_MAP_HORIZ_GAPS
-                && numVert <= MAX_MAP_VERT_GAPS
-                && (float) inkInContent / contentArea >= MIN_MAP_INK_FRACTION) {
-            return new PageLayout(LayoutType.MAP, m, -1, -1, -1, -1, vertGaps, horizGaps);
+        boolean highInkDensity = contentArea > 0
+                && (float) inkInContent / contentArea >= MIN_MAP_INK_FRACTION;
+
+        // Primary MAP path: high density + very few gaps (simple full-page maps)
+        if (highInkDensity
+                && allHorizGaps.size() <= MAX_MAP_HORIZ_GAPS
+                && allVertGaps.size()  <= MAX_MAP_VERT_GAPS) {
+            return new PageLayout(LayoutType.MAP, m, zones,
+                    splitX, splitX2, splitY, splitY2, allVertGaps, allHorizGaps);
         }
 
-        return new PageLayout(LayoutType.SINGLE, m, -1, -1, -1, -1, vertGaps, horizGaps);
+        // Alternate MAP path: large central IMAGE zone (dungeon map + title + legend).
+        // The title and legend create text zones with column gaps that break the primary
+        // path, but the IMAGE zone still dominates the content area.
+        long totalImageHeight = 0;
+        for (Zone z : zones) if (z.type() == ZoneType.IMAGE) totalImageHeight += z.yBottom() - z.yTop();
+        int contentHeight = m.bottom() - m.top();
+        if (highInkDensity && contentHeight > 0
+                && (float) totalImageHeight / contentHeight >= MAP_IMAGE_ZONE_FRACTION) {
+            return new PageLayout(LayoutType.MAP, m, zones,
+                    splitX, splitX2, splitY, splitY2, allVertGaps, allHorizGaps);
+        }
+
+        // ── TABLE check: single column, many horizontal gaps ──────────────────
+        if (textZones.size() == 1 && imageZones.isEmpty()
+                && textZones.get(0).columns().size() == 1) {
+            Column singleCol = textZones.get(0).columns().get(0);
+            long totalHorizGaps = singleCol.subZones().stream()
+                    .filter(cz -> cz.type() == ZoneType.TEXT)
+                    .mapToLong(cz -> cz.horizGaps().size())
+                    .sum();
+            if (totalHorizGaps >= MIN_TABLE_HORIZ_GAPS) {
+                return new PageLayout(LayoutType.TABLE, m, zones,
+                        splitX, splitX2, splitY, splitY2, allVertGaps, allHorizGaps);
+            }
+        }
+
+        // ── Layout type from zone structure ───────────────────────────────────
+        LayoutType type = deriveLayoutType(textZones, imageZones, zones);
+        return new PageLayout(type, m, zones,
+                splitX, splitX2, splitY, splitY2, allVertGaps, allHorizGaps);
+    }
+
+    // ── Pass 0: illustration zone detection ───────────────────────────────────
+
+    /**
+     * Finds contiguous runs of "dense" rows in the content area that represent
+     * illustrations, maps, or other non-text graphics.
+     *
+     * A row is dense when its ink count (from {@code horizProjContent}, which
+     * covers only the content columns) exceeds
+     * {@code contentWidth * ILLUSTRATION_INK_FRACTION}.
+     *
+     * Only runs ≥ {@link #MIN_ILLUSTRATION_PX} tall are returned; shorter runs
+     * (table rules, ornamental lines) are ignored.
+     */
+    /**
+     * Pass 0: bilateral full-width illustration detection.
+     *
+     * Phase A — core detection: a row is "bilaterally dense" when BOTH the left
+     * half AND right half each exceed {@link #FULL_PAGE_ILLUSTRATION_FRACTION} of
+     * the half-width.  Only runs ≥ {@link #MIN_ILLUSTRATION_PX} tall are kept.
+     * Half-page illustrations fail the bilateral check and fall through to Pass 1.5.
+     *
+     * Phase B — fringe extension: each core zone is extended upward and downward
+     * by absorbing rows that have any ink in either half (above
+     * {@link #MIN_INK_FOR_CONTENT}).  This captures the sparse top/bottom edges of
+     * pen-and-ink illustrations that dip below the bilateral threshold, preventing
+     * illustration ink from bleeding into adjacent text zones.  Extension stops at
+     * blank rows (natural paragraph/zone boundaries).
+     */
+    private List<int[]> findFullWidthIllustrationZones(int[] leftProj, int[] rightProj,
+                                                        int yFrom, int yTo, int halfWidth) {
+        int threshold = Math.max(1, (int)(halfWidth * FULL_PAGE_ILLUSTRATION_FRACTION));
+
+        // Phase A: find bilateral dense core zones
+        List<int[]> cores = new ArrayList<>();
+        int start = -1;
+        for (int y = yFrom; y < yTo; y++) {
+            boolean dense = leftProj[y] > threshold && rightProj[y] > threshold;
+            if (dense) {
+                if (start < 0) start = y;
+            } else {
+                if (start >= 0) {
+                    if (y - start >= MIN_ILLUSTRATION_PX) cores.add(new int[]{start, y});
+                    start = -1;
+                }
+            }
+        }
+        if (start >= 0 && yTo - start >= MIN_ILLUSTRATION_PX)
+            cores.add(new int[]{start, yTo});
+
+        if (cores.isEmpty()) return cores;
+
+        // Phase B: extend each core zone up/down through sparse fringe rows
+        List<int[]> extended = new ArrayList<>();
+        for (int[] core : cores) {
+            int top = core[0];
+            int bot = core[1];
+            // Extend upward
+            while (top > yFrom && (leftProj[top - 1] > MIN_INK_FOR_CONTENT
+                                || rightProj[top - 1] > MIN_INK_FOR_CONTENT))
+                top--;
+            // Extend downward
+            while (bot < yTo && (leftProj[bot] > MIN_INK_FOR_CONTENT
+                               || rightProj[bot] > MIN_INK_FOR_CONTENT))
+                bot++;
+            extended.add(new int[]{top, bot});
+        }
+
+        // Merge overlapping or adjacent extended zones
+        List<int[]> merged = new ArrayList<>();
+        int[] cur = extended.get(0).clone();
+        for (int i = 1; i < extended.size(); i++) {
+            int[] next = extended.get(i);
+            if (next[0] <= cur[1]) {
+                cur[1] = Math.max(cur[1], next[1]);
+            } else {
+                merged.add(cur);
+                cur = next.clone();
+            }
+        }
+        merged.add(cur);
+        return merged;
+    }
+
+    /**
+     * Pass 1.5: finds illustration zones within a single column using
+     * {@link #ILLUSTRATION_INK_FRACTION} (0.15) of the column width.
+     */
+    private List<int[]> findIllustrationZones(int[] horizProjContent,
+                                               int yFrom, int yTo, int contentWidth) {
+        return findIllustrationZones(horizProjContent, yFrom, yTo, contentWidth,
+                ILLUSTRATION_INK_FRACTION);
+    }
+
+    private List<int[]> findIllustrationZones(int[] horizProjContent,
+                                               int yFrom, int yTo, int contentWidth,
+                                               float fraction) {
+        int threshold = Math.max(1, (int)(contentWidth * fraction));
+        List<int[]> zones = new ArrayList<>();
+        int start = -1;
+        for (int y = yFrom; y < yTo; y++) {
+            if (horizProjContent[y] > threshold) {
+                if (start < 0) start = y;
+            } else {
+                if (start >= 0) {
+                    if (y - start >= MIN_ILLUSTRATION_PX) zones.add(new int[]{start, y});
+                    start = -1;
+                }
+            }
+        }
+        if (start >= 0 && yTo - start >= MIN_ILLUSTRATION_PX)
+            zones.add(new int[]{start, yTo});
+        return zones;
+    }
+
+    /**
+     * Partitions the content area into an ordered list of TEXT and IMAGE zones
+     * top-to-bottom, then applies Pass 1 and Pass 2 to each TEXT zone.
+     */
+    private List<Zone> buildZones(boolean[] ink, int w, int h, Margins m,
+                                   List<int[]> illZones) {
+        List<Zone> zones = new ArrayList<>();
+        int current = m.top();
+        for (int[] ill : illZones) {
+            if (ill[0] > current)
+                zones.add(buildTextZone(ink, w, h, m, current, ill[0]));
+            zones.add(new Zone(ill[0], ill[1], ZoneType.IMAGE, List.of()));
+            current = ill[1];
+        }
+        if (current < m.bottom()) {
+            int trailingHeight = m.bottom() - current;
+            // If the trailing strip after the last IMAGE zone is too thin to be
+            // real content, it's likely the sparse fringe of the illustration —
+            // extend the IMAGE zone to the content bottom instead.
+            if (trailingHeight < MIN_ILLUSTRATION_PX && !zones.isEmpty()
+                    && zones.get(zones.size() - 1).type() == ZoneType.IMAGE) {
+                Zone last = zones.remove(zones.size() - 1);
+                zones.add(new Zone(last.yTop(), m.bottom(), ZoneType.IMAGE, List.of()));
+            } else {
+                zones.add(buildTextZone(ink, w, h, m, current, m.bottom()));
+            }
+        }
+
+        // Post-process: merge  IMAGE + thin_TEXT + IMAGE  into a single IMAGE zone.
+        // The thin text zone is a sparse interior region of the illustration that
+        // didn't meet the bilateral density threshold row-by-row.
+        int i = zones.size() - 1;
+        while (i >= 2) {
+            Zone z    = zones.get(i);
+            Zone mid  = zones.get(i - 1);
+            Zone prev = zones.get(i - 2);
+            if (z.type() == ZoneType.IMAGE
+                    && mid.type() == ZoneType.TEXT
+                    && prev.type() == ZoneType.IMAGE
+                    && mid.yBottom() - mid.yTop() < MIN_ILLUSTRATION_PX) {
+                zones.set(i - 2, new Zone(prev.yTop(), z.yBottom(), ZoneType.IMAGE, List.of()));
+                zones.remove(i);
+                zones.remove(i - 1);
+                // Don't advance i — recheck the merged zone against what precedes it
+                i -= 2;
+            } else {
+                i--;
+            }
+        }
+
+        return zones;
+    }
+
+    /**
+     * Builds a TEXT zone for rows {@code [yTop, yBottom)}.
+     *
+     * Pass 1   — vertical projection restricted to this zone's rows → column gutters.
+     * Pass 1.5 — per-column horizontal projection → column-scoped IMAGE sub-zones.
+     * Pass 2   — horizontal gaps within each TEXT sub-zone of each column.
+     */
+    private Zone buildTextZone(boolean[] ink, int w, int h, Margins m,
+                                int yTop, int yBottom) {
+        // Pass 1: find column gutters in this zone only
+        int[] vertProjZone = verticalProjection(ink, w, h, yTop, yBottom);
+        int   maxInkPerCol = Math.max(1, (int)((yBottom - yTop) * MAX_INK_FRACTION));
+
+        List<int[]> vGaps = findGaps(vertProjZone, m.left(), m.right(), maxInkPerCol, MIN_VERT_GAP_PX);
+        vGaps = filterIndentGaps(vGaps, m.left(), m.right(), vertProjZone);
+        vGaps = mergeSparseBridges(vGaps, vertProjZone, m.left(), m.right());
+
+        // Derive column x-ranges from gap boundaries
+        List<int[]> colRanges = new ArrayList<>();
+        int prev = m.left();
+        for (int[] gap : vGaps) {
+            colRanges.add(new int[]{prev, gap[0]});
+            prev = gap[1];
+        }
+        colRanges.add(new int[]{prev, m.right()});
+
+        // Pass 1.5 + Pass 2: per-column illustration sub-zones and blank-line gaps
+        List<Column> columns = new ArrayList<>();
+        for (int[] cr : colRanges) {
+            int colLeft  = cr[0], colRight = cr[1];
+            int colWidth = colRight - colLeft;
+
+            // Horizontal projection restricted to this column (full height array, y-indexed)
+            int[] horizProjCol = horizontalProjection(ink, w, h, colLeft, colRight);
+
+            // Pass 1.5: find illustration sub-zones within this column's width
+            List<int[]> colIllZones = findIllustrationZones(horizProjCol, yTop, yBottom, colWidth);
+
+            // Build sub-zones: TEXT regions between/around column illustrations
+            List<ColumnZone> subZones = new ArrayList<>();
+            int cur = yTop;
+            int maxInkPerRow = Math.max(1, (int)(colWidth * MAX_INK_FRACTION));
+            for (int[] ill : colIllZones) {
+                if (ill[0] > cur) {
+                    List<int[]> hGaps = findGaps(horizProjCol, cur, ill[0], maxInkPerRow, MIN_HORIZ_GAP_PX);
+                    subZones.add(new ColumnZone(cur, ill[0], ZoneType.TEXT, hGaps));
+                }
+                subZones.add(new ColumnZone(ill[0], ill[1], ZoneType.IMAGE, List.of()));
+                cur = ill[1];
+            }
+            if (cur < yBottom) {
+                List<int[]> hGaps = findGaps(horizProjCol, cur, yBottom, maxInkPerRow, MIN_HORIZ_GAP_PX);
+                subZones.add(new ColumnZone(cur, yBottom, ZoneType.TEXT, hGaps));
+            }
+
+            columns.add(new Column(colLeft, colRight, subZones));
+        }
+
+        return new Zone(yTop, yBottom, ZoneType.TEXT, columns);
+    }
+
+    /**
+     * Derives a summary {@link LayoutType} from the zone list, used for display
+     * and diagnostics.  The zones list itself is the authoritative split structure
+     * used by {@link PDFPreprocessor}.
+     */
+    private LayoutType deriveLayoutType(List<Zone> textZones, List<Zone> imageZones,
+                                         List<Zone> allZones) {
+        if (textZones.isEmpty()) return LayoutType.MAP;
+
+        int numAll  = allZones.size();
+        int numText = textZones.size();
+
+        if (numAll == 1) {
+            // Single zone, all text
+            int numCols = textZones.get(0).columns().size();
+            if (numCols >= 3) return LayoutType.THREE_COLUMN;
+            if (numCols == 2) return LayoutType.TWO_COLUMN;
+            // Single column: IMAGE sub-zones and large blank-line gaps both count as row splits
+            if (!textZones.get(0).columns().isEmpty()) {
+                Column firstCol = textZones.get(0).columns().get(0);
+                long imageSubZones = firstCol.subZones().stream()
+                        .filter(cz -> cz.type() == ZoneType.IMAGE).count();
+                long largeHorizGaps = firstCol.subZones().stream()
+                        .filter(cz -> cz.type() == ZoneType.TEXT)
+                        .flatMap(cz -> cz.horizGaps().stream())
+                        .filter(g -> g[1] - g[0] >= MIN_ROW_SPLIT_PX).count();
+                long rowSplits = imageSubZones + largeHorizGaps;
+                if (rowSplits >= 2) return LayoutType.THREE_ROW;
+                if (rowSplits == 1) return LayoutType.TWO_ROW;
+            }
+            return LayoutType.SINGLE;
+        }
+
+        // Multiple zones (text + image combinations, or multiple text blocks)
+        int maxCols = textZones.stream().mapToInt(z -> z.columns().size()).max().orElse(0);
+
+        if (numText == 2 && imageZones.isEmpty()) {
+            boolean bothMultiCol = textZones.stream().allMatch(z -> z.columns().size() >= 2);
+            return bothMultiCol ? LayoutType.TWO_BY_TWO : LayoutType.TWO_ROW;
+        }
+        if (numText >= 3 && imageZones.isEmpty()) return LayoutType.THREE_ROW;
+
+        // Mix of text and image zones
+        if (maxCols >= 2) return LayoutType.TWO_BY_TWO;  // column text + image
+        return LayoutType.TWO_ROW;
     }
 
     /**
      * Analyses {@code src} and returns an annotated copy with:
      *   green  – content-area boundary (margin outline)
-     *   red    – vertical white-space bands (column gutters) inside the margins
-     *   blue   – horizontal white-space bands (blank rows) inside the margins
+     *   orange – IMAGE zones (illustrations / maps)
+     *   red    – column gutters per TEXT zone (spans zone height only)
+     *   blue   – horizontal row gaps per column (spans column width only)
      */
     public BufferedImage analyze(BufferedImage src) {
         int w = src.getWidth();
         int h = src.getHeight();
 
-        PageLayout layout   = analyzeLayout(src);
-        Margins    m        = layout.margins();
+        PageLayout layout = analyzeLayout(src);
+        Margins    m      = layout.margins();
 
         BufferedImage out = new BufferedImage(w, h, BufferedImage.TYPE_INT_RGB);
         Graphics2D g2 = out.createGraphics();
@@ -242,16 +593,44 @@ public class ProjectionAnalyzer {
         g2.setColor(Color.GREEN);
         g2.drawRect(m.left(), m.top(), m.right() - m.left(), m.bottom() - m.top());
 
-        // Red: vertical column gutters (height = content area only)
-        g2.setColor(Color.RED);
-        for (int[] gap : layout.vertGaps()) {
-            g2.drawRect(gap[0], m.top(), gap[1] - gap[0], m.bottom() - m.top());
-        }
-
-        // Blue: horizontal blank-row bands (width = content area only)
-        g2.setColor(Color.BLUE);
-        for (int[] gap : layout.horizGaps()) {
-            g2.drawRect(m.left(), gap[0], m.right() - m.left(), gap[1] - gap[0]);
+        for (Zone zone : layout.zones()) {
+            int zt = zone.yTop(), zb = zone.yBottom(), zh = zb - zt;
+            if (zone.type() == ZoneType.IMAGE) {
+                // Orange: illustration / map zone
+                g2.setColor(Color.ORANGE);
+                g2.drawRect(m.left(), zt, m.right() - m.left(), zh);
+            } else {
+                List<Column> cols = zone.columns();
+                // Red: column gutters (between adjacent columns, full zone height)
+                g2.setColor(Color.RED);
+                for (int k = 0; k + 1 < cols.size(); k++) {
+                    int gLeft  = cols.get(k).xRight();
+                    int gRight = cols.get(k + 1).xLeft();
+                    g2.drawRect(gLeft, zt, gRight - gLeft, zh);
+                }
+                // Yellow: column-scoped IMAGE sub-zones (Pass 1.5)
+                g2.setColor(Color.YELLOW);
+                for (Column col : cols) {
+                    for (ColumnZone cz : col.subZones()) {
+                        if (cz.type() == ZoneType.IMAGE) {
+                            g2.drawRect(col.xLeft(), cz.yTop(),
+                                    col.xRight() - col.xLeft(), cz.yBottom() - cz.yTop());
+                        }
+                    }
+                }
+                // Blue: horizontal row gaps within TEXT sub-zones
+                g2.setColor(Color.BLUE);
+                for (Column col : cols) {
+                    for (ColumnZone cz : col.subZones()) {
+                        if (cz.type() == ZoneType.TEXT) {
+                            for (int[] gap : cz.horizGaps()) {
+                                g2.drawRect(col.xLeft(), gap[0],
+                                        col.xRight() - col.xLeft(), gap[1] - gap[0]);
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         g2.dispose();
@@ -320,20 +699,16 @@ public class ProjectionAnalyzer {
         int clusterTop = lastInkRow;
         while (clusterTop > searchFrom && horizProj[clusterTop] >= MIN_INK_FOR_CONTENT) clusterTop--;
         int clusterHeight = lastInkRow - clusterTop;
-        System.err.printf("[DBG] h=%d lastInkRow=%d clusterTop=%d clusterHeight=%d%n",
-                h, lastInkRow, clusterTop, clusterHeight);
 
-        if (clusterHeight > FOOTER_CLUSTER_MAX_PX) { System.err.println("[DBG] -> cluster too tall, fallback"); return lastInkRow; }
+        if (clusterHeight > FOOTER_CLUSTER_MAX_PX) return lastInkRow;
 
         // Step 3: find the first gap above the bottom cluster.
         int gapEnd   = clusterTop;
         int gapStart = gapEnd;
         while (gapStart > searchFrom && horizProj[gapStart] < MIN_INK_FOR_CONTENT) gapStart--;
         int firstGapHeight = gapEnd - gapStart;
-        System.err.printf("[DBG] firstGap: gapEnd=%d gapStart=%d height=%d (need>=%d)%n",
-                gapEnd, gapStart, firstGapHeight, FOOTER_FIRST_GAP_MIN_PX);
 
-        if (firstGapHeight < FOOTER_FIRST_GAP_MIN_PX) { System.err.println("[DBG] -> first gap too small, fallback"); return lastInkRow; }
+        if (firstGapHeight < FOOTER_FIRST_GAP_MIN_PX) return lastInkRow;
 
         // Step 4: iteratively absorb small footer elements above the first gap.
         int boundary = gapStart;
@@ -341,34 +716,26 @@ public class ProjectionAnalyzer {
             int elemTop = boundary;
             while (elemTop > searchFrom && horizProj[elemTop] >= MIN_INK_FOR_CONTENT) elemTop--;
             int elemHeight = boundary - elemTop;
-            System.err.printf("[DBG]   pass %d: boundary=%d elemTop=%d elemHeight=%d%n",
-                    pass, boundary, elemTop, elemHeight);
 
-            if (elemHeight > FOOTER_EXTRA_CLUSTER_MAX_PX) { System.err.println("[DBG]   -> elem too tall, stop"); break; }
+            if (elemHeight > FOOTER_EXTRA_CLUSTER_MAX_PX) break;
 
             int nextGapEnd   = elemTop;
             int nextGapStart = nextGapEnd;
             while (nextGapStart > searchFrom && horizProj[nextGapStart] < MIN_INK_FOR_CONTENT) nextGapStart--;
             int nextGapHeight = nextGapEnd - nextGapStart;
-            System.err.printf("[DBG]   nextGap: end=%d start=%d height=%d (content>=%d)%n",
-                    nextGapEnd, nextGapStart, nextGapHeight, FOOTER_CONTENT_GAP_MIN_PX);
 
             if (nextGapHeight >= FOOTER_CONTENT_GAP_MIN_PX) {
                 // Large gap → confirmed content boundary above this element
                 boundary = nextGapStart;
-                System.err.printf("[DBG]   -> content gap found, boundary=%d%n", boundary);
                 break;
             } else if (elemHeight <= FOOTER_TINY_CLUSTER_MAX_PX && nextGapHeight >= 1) {
                 // Tiny cluster (noise/fragment) with any gap — absorb unconditionally
                 boundary = nextGapStart;
-                System.err.printf("[DBG]   -> tiny cluster, absorb, boundary=%d%n", boundary);
             } else {
                 // Normal-sized cluster with small gap above — it's a content line, stop
-                System.err.println("[DBG]   -> normal cluster + small gap = content, stop");
                 break;
             }
         }
-        System.err.printf("[DBG] -> final boundary=%d%n", boundary);
         return boundary;
     }
 
