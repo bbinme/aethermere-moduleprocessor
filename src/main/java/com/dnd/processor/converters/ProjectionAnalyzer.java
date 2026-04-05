@@ -455,12 +455,15 @@ public class ProjectionAnalyzer {
             breaks.add(new int[]{ill[0], ill[1], 1});
         }
 
-        // Find row-splitting horizontal gaps in text regions between illustrations
+        // Find row-splitting horizontal gaps in text regions between illustrations.
+        // After bridge merging, rescue any content swallowed inside a merged gap
+        // (e.g. a heading between two small gaps gets absorbed as a bridge).
         int current = m.top();
         for (int[] ill : illZones) {
             if (ill[0] > current) {
                 List<int[]> hGaps = findGaps(horizProj, current, ill[0],
                         maxInkForRowGap, MIN_ROW_SPLIT_PX);
+                hGaps = rescueContentInGaps(hGaps, horizProj, maxInkForRowGap);
                 for (int[] g : hGaps) breaks.add(new int[]{g[0], g[1], 0});
             }
             current = ill[1];
@@ -468,6 +471,9 @@ public class ProjectionAnalyzer {
         if (current < m.bottom()) {
             List<int[]> hGaps = findGaps(horizProj, current, m.bottom(),
                     maxInkForRowGap, MIN_ROW_SPLIT_PX);
+            log.debug("[row gaps] range [{},{}) found {} gaps, maxInk={}",
+                    current, m.bottom(), hGaps.size(), maxInkForRowGap);
+            hGaps = rescueContentInGaps(hGaps, horizProj, maxInkForRowGap);
             for (int[] g : hGaps) breaks.add(new int[]{g[0], g[1], 0});
         }
 
@@ -614,7 +620,18 @@ public class ProjectionAnalyzer {
         // gutter x-columns, causing them to exceed maxInkPerCol.  Re-try using only the
         // bottom 80% of the zone — the header ink is concentrated at the top, so the
         // body-only projection typically shows a clean gap.
-
+        if (vGaps.isEmpty() && rowHeight >= 2 * MIN_ILLUSTRATION_PX) {
+            int bodyTop = yTop + rowHeight / 5;  // skip top 20%
+            int[] vertProjBody = verticalProjection(ink, w, h, bodyTop, yBottom);
+            int   maxInkBody   = Math.max(1, (int)((yBottom - bodyTop) * MAX_INK_FRACTION));
+            vGaps = findGaps(vertProjBody, m.left(), m.right(), maxInkBody, MIN_VERT_GAP_PX);
+            vGaps = filterIndentGaps(vGaps, m.left(), m.right(), vertProjBody);
+            vGaps = mergeSparseBridges(vGaps, vertProjBody, m.left(), m.right());
+            if (!vGaps.isEmpty()) {
+                log.debug("[header fallback] found {} column gaps after skipping top 20% of row [{},{})",
+                        vGaps.size(), yTop, yBottom);
+            }
+        }
 
         // Derive column x-ranges from gap boundaries
         List<int[]> colRanges = new ArrayList<>();
@@ -985,6 +1002,11 @@ public class ProjectionAnalyzer {
      */
     private List<int[]> findGaps(int[] proj, int from, int to,
                                   int maxInk, int minWidth) {
+        return findGaps(proj, from, to, maxInk, minWidth, minWidth);
+    }
+
+    private List<int[]> findGaps(int[] proj, int from, int to,
+                                  int maxInk, int minWidth, int maxBridge) {
         // Pass 1: collect raw fragments with a low size floor so that two small
         // adjacent gaps (each below minWidth) can still merge into a valid gutter.
         int rawMin = Math.max(1, minWidth / 2);
@@ -1003,9 +1025,9 @@ public class ProjectionAnalyzer {
         if (start >= 0 && to - start >= rawMin)
             raw.add(new int[]{start, to});
 
-        // Pass 2: merge fragments whose separating bridge is < minWidth — a bridge
-        // that narrow is likely a stray character or serif, not a genuine content run.
-        List<int[]> merged = mergeGaps(raw, minWidth);
+        // Pass 2: merge fragments whose separating bridge is ≤ maxBridge — a bridge
+        // that narrow is likely a decorative rule or serif, not a genuine content run.
+        List<int[]> merged = mergeGaps(raw, maxBridge);
 
         // Pass 3: discard merged gaps that still don't reach the minimum width.
         merged.removeIf(g -> g[1] - g[0] < minWidth);
@@ -1093,6 +1115,57 @@ public class ProjectionAnalyzer {
         long sum = 0;
         for (int x = from; x < to; x++) sum += vertProj[x];
         return (float) sum / (to - from);
+    }
+
+    /**
+     * Checks each gap for content that was swallowed by bridge merging.
+     * If a gap contains a contiguous run of content rows (ink > maxInk)
+     * at least {@link #MIN_HORIZ_GAP_PX} tall, the gap is split into
+     * sub-gaps on either side of the content, preserving the content as
+     * an implicit row between them.
+     */
+    private List<int[]> rescueContentInGaps(List<int[]> gaps, int[] horizProj, int maxInk) {
+        List<int[]> result = new ArrayList<>();
+        for (int[] gap : gaps) {
+            // Find the longest content run inside the gap
+            int bestStart = -1, bestEnd = -1, bestLen = 0;
+            int runStart = -1;
+            for (int y = gap[0]; y <= gap[1]; y++) {
+                boolean hasInk = y < gap[1] && horizProj[y] > maxInk;
+                if (hasInk) {
+                    if (runStart < 0) runStart = y;
+                } else {
+                    if (runStart >= 0) {
+                        int len = y - runStart;
+                        if (len > bestLen) {
+                            bestStart = runStart;
+                            bestEnd = y;
+                            bestLen = len;
+                        }
+                        runStart = -1;
+                    }
+                }
+            }
+            if (bestLen >= MIN_HORIZ_GAP_PX) {
+                // Split: gap before content + gap after content
+                if (bestStart - gap[0] >= MIN_HORIZ_GAP_PX) {
+                    result.add(new int[]{gap[0], bestStart});
+                }
+                if (gap[1] - bestEnd >= MIN_HORIZ_GAP_PX) {
+                    result.add(new int[]{bestEnd, gap[1]});
+                }
+                // If neither sub-gap is large enough, keep the original gap
+                if (bestStart - gap[0] < MIN_HORIZ_GAP_PX
+                        && gap[1] - bestEnd < MIN_HORIZ_GAP_PX) {
+                    result.add(gap);
+                }
+                log.debug("[rescue] content [{},{}) found inside gap [{},{})",
+                        bestStart, bestEnd, gap[0], gap[1]);
+            } else {
+                result.add(gap);
+            }
+        }
+        return result;
     }
 
     /**
