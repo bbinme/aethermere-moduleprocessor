@@ -1,5 +1,8 @@
 package com.dnd.processor.converters;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+
 import java.awt.*;
 import java.awt.image.BufferedImage;
 import java.util.ArrayList;
@@ -39,6 +42,8 @@ import java.util.List;
  *   blue   – horizontal row gaps per column (Phase 3 / Pass 2)
  */
 public class ProjectionAnalyzer {
+
+    private static final Logger log = LogManager.getLogger(ProjectionAnalyzer.class);
 
     // ── Config (all pixel values assume 150 DPI) ──────────────────────────────
 
@@ -881,6 +886,16 @@ public class ProjectionAnalyzer {
         int firstGapHeight = gapEnd - gapStart;
 
         if (firstGapHeight < FOOTER_FIRST_GAP_MIN_PX) return lastInkRow;
+
+        // If the first gap is already large enough to confirm a content/footer
+        // boundary, everything above it is content — don't absorb further.
+        // The iterative loop below handles cases where the first gap is small
+        // (e.g. page number + ornamental rule with a narrow gap between them).
+        if (firstGapHeight >= FOOTER_CONTENT_GAP_MIN_PX) {
+            log.debug("[footer] first gap {}px confirms boundary at y={}",
+                    firstGapHeight, gapStart);
+            return gapStart;
+        }
 
         // Step 4: iteratively absorb small footer elements above the first gap.
         int boundary = gapStart;
