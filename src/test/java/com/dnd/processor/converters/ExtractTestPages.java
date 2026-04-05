@@ -59,8 +59,8 @@ class ExtractTestPages {
             //   Middle two-col:   y=[469, 892)  (includes illustration)
             //   Bottom table:     y=[892, 1400) (wandering monster table)
             // Generous padding avoids clipping text at boundaries.
-            extractPageSection(doc, 4, new File(outDir, "B4-page05-top.pdf"),
-                    0, 510, "3");
+            extractPageSectionWithLabels(doc, 4, new File(outDir, "B4-page05-top.pdf"),
+                    0, 469, "3", null, "Wandering Monsters");
             extractPageSectionWithLabels(doc, 4, new File(outDir, "B4-page05-middle.pdf"),
                     460, 900, "3", "top row of text",
                     "Wandering");
@@ -90,6 +90,13 @@ class ExtractTestPages {
     private static void extractPageSection(PDDocument src, int pageIndex, File out,
                                             int imgTop, int imgBottom, String pageNum)
             throws Exception {
+        extractPageSection(src, pageIndex, out, imgTop, imgBottom, pageNum, null);
+    }
+
+    private static void extractPageSection(PDDocument src, int pageIndex, File out,
+                                            int imgTop, int imgBottom, String pageNum,
+                                            String bottomLabel)
+            throws Exception {
         BufferedImage img = new PDFRenderer(src).renderImageWithDPI(pageIndex, DPI, ImageType.RGB);
         int imgH = img.getHeight();
 
@@ -106,6 +113,7 @@ class ExtractTestPages {
             try (PDPageContentStream cs = new PDPageContentStream(single, p,
                     PDPageContentStream.AppendMode.APPEND, false)) {
                 PDType1Font font = new PDType1Font(Standard14Fonts.FontName.HELVETICA);
+                PDType1Font boldFont = new PDType1Font(Standard14Fonts.FontName.HELVETICA_BOLD);
 
                 cs.setNonStrokingColor(1f, 1f, 1f);
 
@@ -119,6 +127,19 @@ class ExtractTestPages {
                 if (pdfSectionBottom > 0) {
                     cs.addRect(0, 0, pageWidth, pdfSectionBottom);
                     cs.fill();
+                }
+
+                // Draw bottom label below the visible section
+                if (bottomLabel != null) {
+                    float labelFontSize = 28;
+                    float labelWidth = boldFont.getStringWidth(bottomLabel) / 1000 * labelFontSize;
+                    float labelPdfY = pdfSectionBottom - 150 * scaleY;
+                    cs.beginText();
+                    cs.setFont(boldFont, labelFontSize);
+                    cs.setNonStrokingColor(0f, 0f, 0f);
+                    cs.newLineAtOffset((pageWidth - labelWidth) / 2, labelPdfY);
+                    cs.showText(bottomLabel);
+                    cs.endText();
                 }
 
                 // Draw page number centered in footer
@@ -189,26 +210,30 @@ class ExtractTestPages {
                 cs.restoreGraphicsState();
 
                 // Draw header label near the top of the page (in margin, no original text)
-                float labelFontSize = 12;
-                float labelWidth = font.getStringWidth(headerLabel) / 1000 * labelFontSize;
-                float labelPdfY = pageHeight - 30 * scaleY;
-                cs.beginText();
-                cs.setFont(font, labelFontSize);
-                cs.setNonStrokingColor(0f, 0f, 0f);
-                cs.newLineAtOffset((pageWidth - labelWidth) / 2, labelPdfY);
-                cs.showText(headerLabel);
-                cs.endText();
+                if (headerLabel != null) {
+                    float labelFontSize = 12;
+                    float labelWidth = font.getStringWidth(headerLabel) / 1000 * labelFontSize;
+                    float labelPdfY = pageHeight - 30 * scaleY;
+                    cs.beginText();
+                    cs.setFont(font, labelFontSize);
+                    cs.setNonStrokingColor(0f, 0f, 0f);
+                    cs.newLineAtOffset((pageWidth - labelWidth) / 2, labelPdfY);
+                    cs.showText(headerLabel);
+                    cs.endText();
+                }
 
                 // Draw large table heading below the visible section
-                float headingFontSize = 28;
-                float headingWidth = boldFont.getStringWidth(tableHeading) / 1000 * headingFontSize;
-                float headingPdfY = pdfSectionBottom - 150 * scaleY;
-                cs.beginText();
-                cs.setFont(boldFont, headingFontSize);
-                cs.setNonStrokingColor(0f, 0f, 0f);
-                cs.newLineAtOffset((pageWidth - headingWidth) / 2, headingPdfY);
-                cs.showText(tableHeading);
-                cs.endText();
+                if (tableHeading != null) {
+                    float headingFontSize = 28;
+                    float headingWidth = boldFont.getStringWidth(tableHeading) / 1000 * headingFontSize;
+                    float headingPdfY = pdfSectionBottom - 150 * scaleY;
+                    cs.beginText();
+                    cs.setFont(boldFont, headingFontSize);
+                    cs.setNonStrokingColor(0f, 0f, 0f);
+                    cs.newLineAtOffset((pageWidth - headingWidth) / 2, headingPdfY);
+                    cs.showText(tableHeading);
+                    cs.endText();
+                }
 
                 // Draw page number centered in footer
                 float fontSize = 10;

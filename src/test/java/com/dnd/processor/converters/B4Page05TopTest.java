@@ -32,6 +32,7 @@ import static org.junit.jupiter.api.Assertions.*;
 class B4Page05TopTest {
 
     private static final File FIXTURE = new File("src/test/resources/B4-page05-top.pdf");
+    private static final File EXPECTED_MD = new File("src/test/resources/B4-page05-top-expected.md");
     private static final Path OUTPUT_DIR = Path.of("test-output");
     private static final int DPI = 150;
     private static final int SUB_PAGE_MARGIN_PX = 12;
@@ -203,5 +204,14 @@ class B4Page05TopTest {
         assertFalse(markdown.isBlank(), "Markdown should not be empty");
         assertTrue(markdown.length() > 100,
                 "Should have substantial text (got " + markdown.length() + " chars)");
+    }
+
+    @Test
+    void markdownMatchesExpected() throws Exception {
+        org.junit.jupiter.api.Assumptions.assumeTrue(EXPECTED_MD.exists(),
+                "Expected markdown file not found");
+        String expected = Files.readString(EXPECTED_MD.toPath(), StandardCharsets.UTF_8);
+        assertEquals(expected.strip(), markdown.strip(),
+                "Markdown should match expected output");
     }
 }

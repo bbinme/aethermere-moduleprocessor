@@ -471,8 +471,6 @@ public class ProjectionAnalyzer {
         if (current < m.bottom()) {
             List<int[]> hGaps = findGaps(horizProj, current, m.bottom(),
                     maxInkForRowGap, MIN_ROW_SPLIT_PX);
-            log.debug("[row gaps] range [{},{}) found {} gaps, maxInk={}",
-                    current, m.bottom(), hGaps.size(), maxInkForRowGap);
             hGaps = rescueContentInGaps(hGaps, horizProj, maxInkForRowGap);
             for (int[] g : hGaps) breaks.add(new int[]{g[0], g[1], 0});
         }
@@ -544,31 +542,24 @@ public class ProjectionAnalyzer {
         // indicating a full-width header above multi-column content.
         int gapLeft  = zone.columns().get(0).xRight();
         int gapRight = zone.columns().get(1).xLeft();
-
-        // Scan from top: find the first y where the gap has a sustained clean run.
-        // "Clean" = no ink pixels across the gap width at row y.
-        int headerEnd = -1;
-        int cleanRun  = 0;
-        for (int y = yTop; y < yBottom; y++) {
-            boolean rowClean = true;
+        // Scan from top: find where the gutter transitions from blocked to
+        // permanently clean.  A full-width rule below a heading also blocks the
+        // gutter, so we cannot stop at the first clean run — we must scan until
+        // the gutter stays clean for a sustained stretch.
+        // Strategy: find the last ink row in the gutter within the top portion
+        // of the zone (header fallback skipped the top 20%, so the header is in
+        // that top portion).  Limit the scan to the top half of the zone.
+        int scanLimit = yTop + (yBottom - yTop) / 2;
+        int lastInkY = -1;
+        for (int y = yTop; y < scanLimit; y++) {
             for (int x = gapLeft; x < gapRight; x++) {
-                if (ink[y * w + x]) { rowClean = false; break; }
+                if (ink[y * w + x]) { lastInkY = y; break; }
             }
-            if (rowClean) {
-                if (cleanRun == 0) headerEnd = y;
-                cleanRun++;
-            } else {
-                if (cleanRun < MIN_HORIZ_GAP_PX) {
-                    // Short clean run interrupted — not a real gap, reset
-                    headerEnd = -1;
-                }
-                cleanRun = 0;
-            }
-            if (cleanRun >= MIN_HORIZ_GAP_PX) break;
         }
+        int headerEnd = lastInkY >= 0 ? lastInkY + 1 : -1;
 
-        // If the gap is clean from the very top, there's no header — return as-is.
-        // headerEnd == yTop means the gap starts immediately, no header rows above it.
+        // If no ink was found in the gap, or ink starts at the very top,
+        // there's no header — return as-is.
         if (headerEnd <= yTop || headerEnd < 0) return List.of(zone);
 
         // Split: SINGLE header zone + re-analyzed multi-column body zone.
@@ -609,7 +600,7 @@ public class ProjectionAnalyzer {
         // each row contains only one type of content, so cross-contamination from
         // headings or illustrations no longer inflates gutter ink counts.
         int[] vertProjZone = verticalProjection(ink, w, h, yTop, yBottom);
-        int   maxInkPerCol = Math.max(1, (int)((yBottom - yTop) * MAX_INK_FRACTION));
+        int   maxInkPerCol = Math.max(MIN_INK_FOR_CONTENT, (int)((yBottom - yTop) * MAX_INK_FRACTION));
 
         List<int[]> vGaps = findGaps(vertProjZone, m.left(), m.right(), maxInkPerCol, MIN_VERT_GAP_PX);
         vGaps = filterIndentGaps(vGaps, m.left(), m.right(), vertProjZone);
@@ -623,7 +614,7 @@ public class ProjectionAnalyzer {
         if (vGaps.isEmpty() && rowHeight >= 2 * MIN_ILLUSTRATION_PX) {
             int bodyTop = yTop + rowHeight / 5;  // skip top 20%
             int[] vertProjBody = verticalProjection(ink, w, h, bodyTop, yBottom);
-            int   maxInkBody   = Math.max(1, (int)((yBottom - bodyTop) * MAX_INK_FRACTION));
+            int   maxInkBody   = Math.max(MIN_INK_FOR_CONTENT, (int)((yBottom - bodyTop) * MAX_INK_FRACTION));
             vGaps = findGaps(vertProjBody, m.left(), m.right(), maxInkBody, MIN_VERT_GAP_PX);
             vGaps = filterIndentGaps(vGaps, m.left(), m.right(), vertProjBody);
             vGaps = mergeSparseBridges(vGaps, vertProjBody, m.left(), m.right());
