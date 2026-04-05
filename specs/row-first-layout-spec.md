@@ -1,19 +1,21 @@
 # Row-First Layout Analysis — Spec
 
+## Status: Implemented
+
 ## Problem
 
-The current `ProjectionAnalyzer` detects columns across the **full vertical extent** of a
-page zone.  When a zone contains content at different horizontal alignments — a centred
+The original `ProjectionAnalyzer` detected columns across the **full vertical extent** of a
+page zone.  When a zone contained content at different horizontal alignments — a centred
 heading, a half-page illustration beside text, and a bottom table — the vertical projection
-accumulates ink from all of them.  This cross-contamination makes column gap detection
-impossible: a gap that is clean in the two-column body rows is filled by heading ink or
+accumulated ink from all of them.  This cross-contamination made column gap detection
+impossible: a gap that was clean in the two-column body rows was filled by heading ink or
 illustration edge bleed in other rows.
 
 Multiple attempts to patch this (relaxed ink thresholds, body-only fallback, density ratio
 tuning) all failed because the fundamental assumption — one vertical projection per zone —
 cannot handle heterogeneous horizontal structure.
 
-## Proposed Approach
+## Solution
 
 Split each page into **horizontal rows first**, then detect columns independently within
 each row.  Each row contains only one type of horizontal structure, so vertical projection
@@ -21,206 +23,130 @@ within a single row sees clean gaps.
 
 ### Three-Phase Analysis
 
-**Phase 1 — Row Splitting**
+**Phase 1 — Row Splitting** (`buildZones`)
 
-After margin detection, compute the horizontal projection across the full content width
-(as today).  Find significant horizontal gaps (blank rows ≥ `minRowSplitPx`) that divide
-the content area into horizontal rows.  This is essentially the current Pass 0 + the
-horizontal gap detection from Pass 2, but applied at the page level before any column
-detection.
+After margin detection, two sources of breaks divide the content area into rows:
 
-Each row is a horizontal band `[yTop, yBottom)` spanning the full content width.
+1. Full-width illustration zones (bilateral density check) → become IMAGE rows
+2. Significant horizontal gaps (≥ `minRowSplitPx`, blank rows with ink ≤ `maxInkFraction`
+   of content width) → whitespace separators between rows (no row generated for the gap)
 
-Rows may be:
-- Separated by clear blank-line gaps (e.g. gap between a boxed section and body text)
-- Separated by illustration boundaries (the current Pass 0 bilateral detection identifies
-  full-width illustration zones that naturally break the page into rows)
+All breaks are sorted by y-position.  Text regions between breaks become independent rows,
+each receiving its own column detection.
 
-Phase 1 produces an ordered list of **Row** records: `(yTop, yBottom)`.
+**Phase 2 — Per-Row Column Detection** (`buildTextZone`)
 
-**Phase 2 — Per-Row Classification**
+For each text row independently:
 
-For each row independently:
+1. Short-row guard: rows shorter than `minIllustrationPx` (80px, ~4 text lines at 150 DPI)
+   skip column detection entirely — they cannot contain meaningful multi-column content.
+   This prevents false gutters through character/word gaps in headings.
 
-1. **Illustration check**: If the row's ink density (bilateral) is high and contiguous,
-   classify as `IMAGE`.  This is the existing Pass 0 bilateral check, now applied per-row
-   rather than across the whole content area.
+2. Vertical projection restricted to the row's y-range.  Column gutters found using
+   `findGaps` + `filterIndentGaps` + `mergeSparseBridges` with the strict `maxInkFraction`
+   (0.5%) threshold.
 
-2. **Column detection** (current Pass 1): Compute the vertical projection restricted to
-   this row's y-range only.  Find column gutters using `findGaps` + `filterIndentGaps` +
-   `mergeSparseBridges`.  Because the projection only covers this row's content, a heading
-   row sees no gap (correct — it's single-column), while the two-column body row sees a
-   clean gap (correct — no heading ink contaminating it).
+3. The strict threshold (0.5%) is safe because row splitting ensures each row contains only
+   one type of content — no cross-contamination from headings or illustrations.
 
-3. **Content-type hints**:
-   - A row with ≥ `minTableHorizGaps` horizontal gaps and a single column → TABLE
-   - A row with high bilateral ink density → IMAGE / MAP
-   - A row with a boxed border (ink at left/right edges + top/bottom edges of the row) →
-     BOXED_TEXT (future enhancement, not in initial implementation)
+**Phase 3 — Per-Column Sub-Zone Detection** (unchanged)
 
-Phase 2 produces a **ClassifiedRow**: `(yTop, yBottom, RowType, columns[])`.
-- `RowType`: IMAGE, SINGLE, TWO_COLUMN, THREE_COLUMN, TABLE
-- `columns[]`: for text rows, the column x-ranges from gap detection
+For each column in each row:
+- Pass 1.5: column-scoped illustration detection with Phase B fringe extension
+- Pass 2: horizontal gap detection within TEXT sub-zones
 
-**Phase 3 — Per-Column Sub-Zone Detection**
+**Header Split** (`buildTextZoneWithHeaderSplit`)
 
-For each column in each text row:
-1. Pass 1.5 (column-scoped illustration detection) — unchanged from current logic
-2. Pass 2 (horizontal gap detection within each TEXT sub-zone) — unchanged
+After column detection, if a row has multiple columns, a header check runs: scan from the
+top of the row to find where the column gap first becomes clean.  If the top portion has ink
+at the gap position (a centred heading spanning the gutter), split into a SINGLE header zone
++ a multi-column body zone.  This handles cases where the gap between a heading and the
+content below it is too small for Phase 1 row splitting (< `minRowSplitPx`).
 
-This is identical to the current Pass 1.5 and Pass 2, but now each column's vertical
-extent is limited to its row, not the full page zone.
+### Removed: Pass 1b (Header Fallback)
 
-### Key Difference from Current Architecture
+The old Pass 1b re-scanned the bottom 80% of a zone when Pass 1 found no column gaps,
+attempting to skip header ink that contaminated the gutter.  **This is removed** because:
 
-Current flow:
-```
-Page → Pass 0 (full-width illustrations) → TEXT/IMAGE zones
-     → Pass 1 (columns across full zone height) → columns
-     → Pass 1.5 (per-column illustrations) → sub-zones
-     → Pass 2 (horizontal gaps per sub-zone)
-```
+1. Row-first splitting now handles header isolation — headers get their own rows.
+2. Pass 1b was actively harmful: when Pass 1 correctly found no gap in a heading-only row
+   (e.g. "Dungeon Module B4" / "The Lost City" on a title page), Pass 1b would re-scan a
+   smaller region and find false gaps through character spacing in the remaining text.
+3. The 80% body region sometimes contained only one or two lines of text, where inter-word
+   gaps of 10px could survive `filterIndentGaps` and produce false two-column splits.
 
-New flow:
-```
-Page → Margins → Horizontal row split (gaps + bilateral illustration detection)
-     → Per-row column detection (vertical projection scoped to row)
-     → Per-column sub-zone detection (Pass 1.5 + Pass 2, scoped to row)
-```
+### Column Gap Ink Threshold
 
-The critical change: column detection sees only one row's worth of ink, not the full zone.
+Changed from `maxColumnGapInkFraction` (3%) back to `maxInkFraction` (0.5%).
 
-## Data Model Changes
+The elevated 3% threshold was a workaround for cross-contamination: heading text and
+illustration edge bleed injected a few ink pixels into gutter columns, and the strict 0.5%
+threshold rejected them.  With row-first splitting, each row's projection only contains
+that row's ink — no cross-contamination.  The strict threshold is restored because:
 
-### New record: `Row`
+- At 150 DPI, thin character strokes (connecting arches in "n", "m", serifs) produce only
+  1-2 ink pixels in the vertical projection.  The 3% threshold (maxInk=4 for a 150px row)
+  treated these as "empty," allowing column gaps to pass through letterforms.
+- Real column gutters have zero ink — the strict threshold detects them correctly.
+- Bridge merging in `findGaps` already handles stray noise pixels (serifs, hyphens) by
+  merging across bridges < `minVertGapPx` wide.
 
-```java
-public enum RowType { IMAGE, SINGLE, TWO_COLUMN, THREE_COLUMN, TABLE }
+### Cover Page Handling
 
-public record Row(int yTop, int yBottom, RowType type, List<Column> columns) {}
-```
+`PDFPreprocessor.processLayout` now creates a single full-width sub-page for FRONT_COVER,
+BACK_COVER, and MAP pages (`isFullPageLayout` types), skipping zone/column iteration
+entirely.  Previously, `withCoverOverride` only changed the display label but zones were
+still split into sub-pages with false column gutters.
 
-### Zone model
+### Illustration Fringe Extension (Pass 1.5)
 
-The existing `Zone` / `Column` / `ColumnZone` hierarchy remains for the per-column
-sub-zone structure (Pass 1.5 + Pass 2).  `Row` wraps the column list and replaces the
-current `Zone` as the top-level page decomposition unit.
+Column-scoped illustration detection (`findIllustrationZones`) now includes Phase B fringe
+extension, mirroring what Pass 0 already does for full-width illustrations.  After finding
+the dense core zone, it extends upward/downward through rows with any ink above
+`minInkForContent`, stopping at blank rows.  This fixes illustration zone boundaries cutting
+off sparse trailing edges (thin lines, details) that fell below the 15% density threshold.
 
-`PageLayout.zones` field type changes from `List<Zone>` to `List<Row>`.  Downstream
-consumers (`PDFPreprocessor`, `deriveLayoutType`, debug drawing) update accordingly.
-
-Alternatively, if the refactor is too large, `Row` could simply be a new `Zone` variant
-where `ZoneType` gains `TABLE` etc., but a dedicated `Row` type is cleaner because rows
-and zones serve different roles (page decomposition vs. column sub-structure).
-
-## Algorithm Detail — Phase 1 Row Splitting
-
-1. Detect margins (unchanged).
-2. Compute horizontal projection `horizProj[y]` for content columns `[m.left, m.right)`.
-3. Find full-width illustration zones using bilateral check (current Pass 0).
-4. In the non-illustration regions, find horizontal gaps ≥ `minRowSplitPx`.
-5. Illustration zones and horizontal gaps together partition the content area into rows.
-
-Example for B4 page 5 ("Players' Background" box + two-column text + encounter table):
-
-```
-Row 0:  y=85..240   — boxed title section (Players' Background)
-        [gap: y=240..265, ~25px blank]
-Row 1:  y=265..780  — two-column body text with left-column illustration  
-        [gap: y=780..805, ~25px blank]
-Row 2:  y=805..1050 — encounter table
-```
-
-## Algorithm Detail — Phase 2 Per-Row Column Detection
-
-For each non-IMAGE row:
-
-```java
-int[] vertProj = verticalProjection(ink, w, h, row.yTop, row.yBottom);
-int maxInk = (int)((row.yBottom - row.yTop) * MAX_COLUMN_GAP_INK_FRACTION);
-List<int[]> vGaps = findGaps(vertProj, m.left, m.right, maxInk, MIN_VERT_GAP_PX);
-vGaps = filterIndentGaps(vGaps, m.left, m.right, vertProj);
-vGaps = mergeSparseBridges(vGaps, vertProj, m.left, m.right);
-```
-
-This is identical to the current Pass 1 code, but `yTop`/`yBottom` now span only the
-row, not the full zone.
-
-## Impact on PDFPreprocessor
-
-`processLayout` currently iterates `layout.zones()` and creates sub-pages per zone/column/
-sub-zone.  With the new model it iterates rows instead:
-
-```
-for each Row:
-  if IMAGE → one full-width sub-page
-  if SINGLE → one full-width sub-page
-  if TWO_COLUMN/THREE_COLUMN → one sub-page per column (per sub-zone within each column)
-  if TABLE → one full-width sub-page
-```
-
-The per-column sub-page creation (iterating `Column` → `ColumnZone`) is unchanged.
-
-## Impact on deriveLayoutType
-
-`deriveLayoutType` currently infers the page-level LayoutType from zone/column counts.
-With rows, the logic becomes:
-
-- All rows SINGLE or IMAGE → use existing heuristics (SINGLE, MAP, TWO_ROW, THREE_ROW)
-- Any row is TWO_COLUMN → TWO_COLUMN (or TWO_BY_TWO if multiple two-col rows separated
-  by an image)
-- Mix of row types → compose from row types (e.g. SINGLE + TWO_COLUMN + TABLE → THREE_ROW)
-
-The exact mapping can remain similar to today; the difference is that the input data is
-now more accurate because column detection operates per-row.
-
-## Impact on Debug Drawing
-
-- Green: margins (unchanged)
-- Orange: IMAGE rows (was: IMAGE zones)
-- Red: column gutters per row (was: per zone — now correctly scoped to row height)
-- Yellow: column-scoped IMAGE sub-zones within each column (unchanged)
-- Blue: horizontal gaps within column TEXT sub-zones (unchanged)
-- New: row boundaries could be drawn in a distinct colour (e.g. cyan) to show the Phase 1
-  decomposition
+---
 
 ## Files Changed
 
 | File | Change |
 |------|--------|
-| `ProjectionAnalyzer.java` | New `Row`/`RowType` records; refactor `analyzeLayout` to Phase 1→2→3 flow; `buildTextZone` becomes per-row; `deriveLayoutType` updated |
-| `PDFPreprocessor.java` | Iterate rows instead of zones for sub-page creation |
-| `DnD_BasicSet.java` | No new constants needed (reuses `minRowSplitPx`, existing thresholds) |
+| `ProjectionAnalyzer.java` | Row-first `buildZones`; `buildTextZoneWithHeaderSplit`; short-row guard in `buildTextZone`; removed Pass 1b; reverted to strict ink threshold; Pass 1.5 fringe extension; cyan debug drawing for row boundaries |
+| `PDFPreprocessor.java` | Single sub-page for cover/MAP pages |
 
 ## What This Fixes
 
-- **B4 page 5**: The centred "Players' Background" heading is in its own row. The two-column
-  body (with left-column illustration) is in a separate row. Column detection in the body row
-  sees a clean gutter because the heading ink is not in its projection. The illustration is
-  detected by Pass 1.5 within the left column of the body row only.
-
-- **Any page with a full-width heading above two-column text**: The heading becomes its own
-  SINGLE row; the body becomes a TWO_COLUMN row. No special "header detection" heuristic
-  needed.
-
-- **Pages with tables below body text**: The table becomes its own row, classified
-  independently. No risk of table horizontal gaps confusing column detection in the body.
+- **B4 page 2 (title page)**: No false column gap through "The Lost City" character spacing.
+  Title row correctly detected as single-column.
+- **B4 page 5 (Players' Background box + two-col + table)**: Heading is split from the
+  box content.  Column detection in the body row sees a clean gutter.
+- **B4 page 12 (two-col with left-column illustration)**: Body row detects 2 columns,
+  illustration stays in left column only (Pass 1.5 with fringe extension).
+- **Section headings** ("PART 4: TIER 5..."): Short-row guard prevents false column
+  detection through word gaps in headings < 80px tall.
+- **Cover pages**: Single sub-page output, no spurious column splits.
+- **Any page with a full-width heading above two-column text**: Row splitting isolates the
+  heading; `buildTextZoneWithHeaderSplit` handles cases where the gap is too small for
+  Phase 1 splitting.
 
 ## What Stays the Same
 
-- Margin detection
-- Bilateral full-width illustration detection (Phase B fringe extension)
+- Margin detection (including footer isolation)
+- Bilateral full-width illustration detection (Pass 0 with Phase B fringe extension)
 - `findGaps`, `filterIndentGaps`, `mergeSparseBridges` (unchanged algorithms)
-- Pass 1.5 column-scoped illustration detection
 - Pass 2 horizontal gap detection per TEXT sub-zone
 - Config system (`DnD_BasicSet` hierarchy)
 - `ColumnAwareTextStripper` (independent text extraction path)
+- `deriveLayoutType` (unchanged, works with more granular zone list)
 
 ## Test Cases
 
-- B4 page 5 (Players' Background box + two-col + table) → 3 rows, correct column detection
-- B4 page 12 (two-col with left-column illustration) → body row detects 2 columns, illustration stays in left column only
-- Normal two-column pages (no heading) → 1 row with 2 columns (unchanged behaviour)
+- B4 page 2 (title page) → single-column rows, no false gutter
+- B4 page 5 (Players' Background + two-col + table) → 3+ rows, correct column detection
+- B4 page 12 (two-col with left-column illustration) → 2 columns, illustration bounded
+- Normal two-column pages (no heading) → 1 row with 2 columns (unchanged)
 - Single-column pages → 1 row, SINGLE (unchanged)
 - Full-page maps → 1 IMAGE row (unchanged)
-- B1 page 34 (text + illustration + text) → rows split at illustration boundaries
+- Section headings (< 80px) → single-column, no false gaps
+- Cover pages → single sub-page in layout PDF

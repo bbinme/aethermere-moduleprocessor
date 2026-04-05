@@ -473,7 +473,7 @@ public class ProjectionAnalyzer {
         current = m.top();
         for (int[] brk : breaks) {
             if (brk[0] > current) {
-                rows.add(buildTextZone(ink, w, h, m, current, brk[0]));
+                rows.addAll(buildTextZoneWithHeaderSplit(ink, w, h, m, current, brk[0]));
             }
             if (brk[2] == 1) {
                 rows.add(new Zone(brk[0], brk[1], ZoneType.IMAGE, List.of()));
@@ -487,7 +487,7 @@ public class ProjectionAnalyzer {
                 Zone last = rows.remove(rows.size() - 1);
                 rows.add(new Zone(last.yTop(), m.bottom(), ZoneType.IMAGE, List.of()));
             } else {
-                rows.add(buildTextZone(ink, w, h, m, current, m.bottom()));
+                rows.addAll(buildTextZoneWithHeaderSplit(ink, w, h, m, current, m.bottom()));
             }
         }
 
@@ -514,6 +514,63 @@ public class ProjectionAnalyzer {
     }
 
     /**
+     * Builds one or more TEXT zones for the band {@code [yTop, yBottom)}.
+     *
+     * After column detection, checks whether the top of the row is a full-width
+     * header that spans the column gutter.  If so, splits into a SINGLE header
+     * zone + a multi-column body zone.  This handles centred headings like
+     * "Players' Background" above a two-column read-aloud box where the gap
+     * between heading and box is too small for Phase 1 row splitting.
+     */
+    private List<Zone> buildTextZoneWithHeaderSplit(boolean[] ink, int w, int h,
+                                                     Margins m, int yTop, int yBottom) {
+        Zone zone = buildTextZone(ink, w, h, m, yTop, yBottom);
+
+        // Only split if the zone has multiple columns
+        if (zone.columns().size() < 2) return List.of(zone);
+
+        // Check if the column gap is blocked (has ink) at the top of the zone,
+        // indicating a full-width header above multi-column content.
+        int gapLeft  = zone.columns().get(0).xRight();
+        int gapRight = zone.columns().get(1).xLeft();
+
+        // Scan from top: find the first y where the gap has a sustained clean run.
+        // "Clean" = no ink pixels across the gap width at row y.
+        int headerEnd = -1;
+        int cleanRun  = 0;
+        for (int y = yTop; y < yBottom; y++) {
+            boolean rowClean = true;
+            for (int x = gapLeft; x < gapRight; x++) {
+                if (ink[y * w + x]) { rowClean = false; break; }
+            }
+            if (rowClean) {
+                if (cleanRun == 0) headerEnd = y;
+                cleanRun++;
+            } else {
+                if (cleanRun < MIN_HORIZ_GAP_PX) {
+                    // Short clean run interrupted — not a real gap, reset
+                    headerEnd = -1;
+                }
+                cleanRun = 0;
+            }
+            if (cleanRun >= MIN_HORIZ_GAP_PX) break;
+        }
+
+        // If the gap is clean from the very top, there's no header — return as-is.
+        // headerEnd == yTop means the gap starts immediately, no header rows above it.
+        if (headerEnd <= yTop || headerEnd < 0) return List.of(zone);
+
+        // Split: SINGLE header zone + re-analyzed multi-column body zone.
+        int xLeft  = zone.columns().get(0).xLeft();
+        int xRight = zone.columns().get(zone.columns().size() - 1).xRight();
+        Zone header = new Zone(yTop, headerEnd, ZoneType.TEXT,
+                List.of(new Column(xLeft, xRight,
+                        List.of(new ColumnZone(yTop, headerEnd, ZoneType.TEXT, List.of())))));
+        Zone body = buildTextZone(ink, w, h, m, headerEnd, yBottom);
+        return List.of(header, body);
+    }
+
+    /**
      * Builds a TEXT row for the horizontal band {@code [yTop, yBottom)}.
      *
      * Phase 2 — vertical projection restricted to this row's y-range → column gutters.
@@ -522,13 +579,26 @@ public class ProjectionAnalyzer {
      */
     private Zone buildTextZone(boolean[] ink, int w, int h, Margins m,
                                 int yTop, int yBottom) {
+        // Guard: rows shorter than MIN_ILLUSTRATION_PX (~4 text lines at 150 DPI)
+        // cannot contain meaningful multi-column content.  Skip column detection
+        // to avoid false gutters through character/word gaps in headings.
+        int rowHeight = yBottom - yTop;
+        if (rowHeight < MIN_ILLUSTRATION_PX) {
+            int colWidth = m.right() - m.left();
+            int[] horizProj = horizontalProjection(ink, w, h, m.left(), m.right());
+            int maxInkPerRow = Math.max(1, (int)(colWidth * MAX_INK_FRACTION));
+            List<int[]> hGaps = findGaps(horizProj, yTop, yBottom, maxInkPerRow, MIN_HORIZ_GAP_PX);
+            return new Zone(yTop, yBottom, ZoneType.TEXT,
+                    List.of(new Column(m.left(), m.right(),
+                            List.of(new ColumnZone(yTop, yBottom, ZoneType.TEXT, hGaps)))));
+        }
+
         // Pass 1: find column gutters in this zone only.
-        // Uses the more tolerant MAX_COLUMN_GAP_INK_FRACTION (3%) instead of
-        // MAX_INK_FRACTION (0.5%) — column gutters adjacent to illustrations or
-        // below full-width headings have stray ink from edge bleed / heading text
-        // that exceeds the strict threshold but is far below real content density.
+        // Uses the strict MAX_INK_FRACTION (0.5%) — row-first splitting ensures
+        // each row contains only one type of content, so cross-contamination from
+        // headings or illustrations no longer inflates gutter ink counts.
         int[] vertProjZone = verticalProjection(ink, w, h, yTop, yBottom);
-        int   maxInkPerCol = Math.max(1, (int)((yBottom - yTop) * MAX_COLUMN_GAP_INK_FRACTION));
+        int   maxInkPerCol = Math.max(1, (int)((yBottom - yTop) * MAX_INK_FRACTION));
 
         List<int[]> vGaps = findGaps(vertProjZone, m.left(), m.right(), maxInkPerCol, MIN_VERT_GAP_PX);
         vGaps = filterIndentGaps(vGaps, m.left(), m.right(), vertProjZone);
@@ -539,17 +609,7 @@ public class ProjectionAnalyzer {
         // gutter x-columns, causing them to exceed maxInkPerCol.  Re-try using only the
         // bottom 80% of the zone — the header ink is concentrated at the top, so the
         // body-only projection typically shows a clean gap.
-        if (vGaps.isEmpty()) {
-            int topSkip  = (int)((yBottom - yTop) * 0.20f);
-            int bodyStart = yTop + topSkip;
-            if (bodyStart < yBottom) {
-                int[] vertProjBody = verticalProjection(ink, w, h, bodyStart, yBottom);
-                int   maxInkBody   = Math.max(1, (int)((yBottom - bodyStart) * MAX_COLUMN_GAP_INK_FRACTION));
-                vGaps = findGaps(vertProjBody, m.left(), m.right(), maxInkBody, MIN_VERT_GAP_PX);
-                vGaps = filterIndentGaps(vGaps, m.left(), m.right(), vertProjBody);
-                vGaps = mergeSparseBridges(vGaps, vertProjBody, m.left(), m.right());
-            }
-        }
+
 
         // Derive column x-ranges from gap boundaries
         List<int[]> colRanges = new ArrayList<>();

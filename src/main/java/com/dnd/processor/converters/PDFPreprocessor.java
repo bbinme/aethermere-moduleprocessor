@@ -131,23 +131,26 @@ public class PDFPreprocessor {
 
                 ProjectionAnalyzer.Margins m = layout.margins();
 
-                // Iterate over zones top-to-bottom.
-                // Full-width IMAGE zones (Pass 0) become a single full-width sub-page.
-                // TEXT zones are split into columns; within each column, column-scoped
-                // IMAGE sub-zones (Pass 1.5) and TEXT sub-zones each become one sub-page.
-                for (ProjectionAnalyzer.Zone zone : layout.zones()) {
-                    int zt = zone.yTop(), zb = zone.yBottom();
-                    if (zone.type() == ProjectionAnalyzer.ZoneType.IMAGE
-                            || zone.columns().isEmpty()) {
-                        // Full-width IMAGE zone or degenerate text zone
-                        addSubPage(output, source, i, med, imgW, imgH, scaleX, scaleY,
-                                   m.left(), zt, m.right(), zb);
-                    } else {
-                        // One sub-page per column sub-zone
-                        for (ProjectionAnalyzer.Column col : zone.columns()) {
-                            for (ProjectionAnalyzer.ColumnZone cz : col.subZones()) {
-                                addSubPage(output, source, i, med, imgW, imgH, scaleX, scaleY,
-                                           col.xLeft(), cz.yTop(), col.xRight(), cz.yBottom());
+                // Cover pages → single full-width sub-page (no column/row splitting).
+                // All other pages → iterate zones for sub-page creation.
+                if (isFullPageLayout(layout.type())) {
+                    addSubPage(output, source, i, med, imgW, imgH, scaleX, scaleY,
+                               m.left(), m.top(), m.right(), m.bottom());
+                } else {
+                    for (ProjectionAnalyzer.Zone zone : layout.zones()) {
+                        int zt = zone.yTop(), zb = zone.yBottom();
+                        if (zone.type() == ProjectionAnalyzer.ZoneType.IMAGE
+                                || zone.columns().isEmpty()) {
+                            // Full-width IMAGE zone or degenerate text zone
+                            addSubPage(output, source, i, med, imgW, imgH, scaleX, scaleY,
+                                       m.left(), zt, m.right(), zb);
+                        } else {
+                            // One sub-page per column sub-zone
+                            for (ProjectionAnalyzer.Column col : zone.columns()) {
+                                for (ProjectionAnalyzer.ColumnZone cz : col.subZones()) {
+                                    addSubPage(output, source, i, med, imgW, imgH, scaleX, scaleY,
+                                               col.xLeft(), cz.yTop(), col.xRight(), cz.yBottom());
+                                }
                             }
                         }
                     }
