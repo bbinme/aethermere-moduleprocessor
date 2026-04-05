@@ -92,7 +92,7 @@ class B4Page07Test {
 
         // 4. Extract markdown from layout PDF
         PdfConverter converter = new PdfConverter();
-        ConversionResult result = converter.convert(layoutPdf);
+        ConversionResult result = converter.convert(layoutPdf, "glossaries/B4.txt");
         markdown = result.markdown();
 
         // 5. Write markdown for visual verification

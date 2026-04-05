@@ -478,6 +478,9 @@ public class ProjectionAnalyzer {
         }
 
         breaks.sort((a, b) -> Integer.compare(a[0], b[0]));
+        for (int[] brk : breaks) {
+            log.debug("[phase1 break] [{},{}) type={}", brk[0], brk[1], brk[2] == 1 ? "IMAGE" : "GAP");
+        }
 
         // ── Phase 2: build rows from breaks ──────────────────────────────────
         List<Zone> rows = new ArrayList<>();
@@ -521,23 +524,45 @@ public class ProjectionAnalyzer {
             }
         }
 
-        // Post-process: absorb a short TEXT zone that follows a TABLE zone.
-        // The last table row may fall just past the gap boundary and end up as a
-        // separate TEXT zone.  Merge it back into the TABLE if it's short enough
-        // (shorter than the average table content run).
+        // Post-process: absorb trailing zones into a TABLE zone.
+        // Phase 1 bridge merging can split table rows into separate zones when
+        // the gap between rows exceeds MIN_ROW_SPLIT_PX.  Absorb the next zone
+        // if it starts with a short content run (a table row) followed by a gap.
         for (i = 0; i < rows.size() - 1; i++) {
             Zone tbl  = rows.get(i);
             Zone next = rows.get(i + 1);
-            if (tbl.type() == ZoneType.TABLE && next.type() == ZoneType.TEXT
-                    && next.yBottom() - next.yTop() < MIN_ROW_SPLIT_PX) {
-                // Rebuild the TABLE zone with the extended range
-                Zone merged = buildTextZone(ink, w, h, m, tbl.yTop(), next.yBottom());
-                rows.set(i, merged);
+            if (tbl.type() != ZoneType.TABLE || next.type() != ZoneType.TEXT) continue;
+
+            // Check if the next zone starts with a table-row-like pattern:
+            // a short content run (< MIN_ROW_SPLIT_PX) followed by a gap.
+            int nextTop = next.yTop(), nextBot = next.yBottom();
+            int[] nextHProj = horizontalProjection(ink, w, h, m.left(), m.right());
+            int maxInkNext = Math.max(1, (int)((m.right() - m.left()) * MAX_INK_FRACTION));
+
+            // Find the first gap in the next zone
+            List<int[]> nextGaps = findGaps(nextHProj, nextTop, nextBot, maxInkNext, MIN_HORIZ_GAP_PX);
+            if (nextGaps.isEmpty()) continue;
+
+            // The leading content run is from nextTop to the first gap
+            int firstRunHeight = nextGaps.get(0)[0] - nextTop;
+            if (firstRunHeight <= 0 || firstRunHeight >= MIN_ROW_SPLIT_PX) continue;
+
+            // The leading run looks like a table row. Split: absorb the row
+            // into the table and keep the rest as a separate zone.
+            int splitAt = nextGaps.get(0)[1]; // after the gap following the row
+            Zone combined = buildTextZone(ink, w, h, m, tbl.yTop(), splitAt);
+            rows.set(i, combined);
+            if (splitAt < nextBot) {
+                // Re-analyze the remainder
+                List<Zone> remainder = buildTextZoneWithHeaderSplit(ink, w, h, m, splitAt, nextBot);
                 rows.remove(i + 1);
-                log.debug("[table absorb] merged trailing TEXT [{},{}) into TABLE → [{},{})",
-                        next.yTop(), next.yBottom(), tbl.yTop(), next.yBottom());
-                i--; // re-check in case there are more trailing zones
+                rows.addAll(i + 1, remainder);
+            } else {
+                rows.remove(i + 1);
             }
+            log.debug("[table absorb] absorbed row [{},{}) into TABLE → [{},{})",
+                    nextTop, splitAt, tbl.yTop(), splitAt);
+            i--; // re-check in case there are more trailing rows
         }
 
         return rows;
@@ -572,16 +597,21 @@ public class ProjectionAnalyzer {
         // that top portion).  Limit the scan to the top half of the zone.
         int scanLimit = yTop + (yBottom - yTop) / 2;
         int lastInkY = -1;
+        int inkRowCount = 0;
         for (int y = yTop; y < scanLimit; y++) {
             for (int x = gapLeft; x < gapRight; x++) {
-                if (ink[y * w + x]) { lastInkY = y; break; }
+                if (ink[y * w + x]) { lastInkY = y; inkRowCount++; break; }
             }
         }
         int headerEnd = lastInkY >= 0 ? lastInkY + 1 : -1;
 
         // If no ink was found in the gap, or ink starts at the very top,
         // there's no header — return as-is.
+        // Require multiple rows of gutter ink and a minimum header height
+        // to avoid false splits from stray pixels or character fragments
+        // bleeding into the gutter.
         if (headerEnd <= yTop || headerEnd < 0) return List.of(zone);
+        if (inkRowCount < 3 || (headerEnd - yTop) < MIN_HORIZ_GAP_PX) return List.of(zone);
 
         // Split: SINGLE header zone + re-analyzed multi-column body zone.
         int xLeft  = zone.columns().get(0).xLeft();
@@ -1210,10 +1240,13 @@ public class ProjectionAnalyzer {
                 // Extend past last content run to include descenders / trailing pixels
                 int tableEnd   = Math.min(gap[1],
                         contentRuns.get(contentRuns.size() - 1)[1] + MIN_HORIZ_GAP_PX);
-                if (tableStart - gap[0] >= MIN_HORIZ_GAP_PX) {
+                // Use MIN_ROW_SPLIT_PX for sub-gaps around table regions — small
+                // trailing gaps (e.g. 18px between last detected row and the next
+                // row) should not become Phase 1 breaks that split the table.
+                if (tableStart - gap[0] >= MIN_ROW_SPLIT_PX) {
                     result.add(new int[]{gap[0], tableStart});
                 }
-                if (gap[1] - tableEnd >= MIN_HORIZ_GAP_PX) {
+                if (gap[1] - tableEnd >= MIN_ROW_SPLIT_PX) {
                     result.add(new int[]{tableEnd, gap[1]});
                 }
                 log.debug("[rescue table] {} content runs → single region [{},{}) in gap [{},{}). Runs: {}",

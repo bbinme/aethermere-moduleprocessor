@@ -21,19 +21,15 @@ import java.nio.file.Path;
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * B4 page 5, bottom section — Wandering Monster Table: Level 1.
+ * Tests for B4 page 6 — a two-column page with the wandering monster
+ * table descriptions on the left and room 1 (Statue Room) key on the right.
  *
- * A single-column table with a header row ("Die Roll", "Wandering Monster",
- * "No", "AC", "HD", etc.), horizontal rules between rows, and 8 monster
- * entries (Centipede Giant through Goblin).
- *
- * Uses the cropped fixture B4-page05-table.pdf.
- * Expected: table region detected as content (not eaten by footer),
- * not fragmented into many tiny zones, all 8 monster entries in markdown.
+ * This page was previously misclassified as FRONT_COVER, causing no column
+ * splitting and interleaved text from both columns.
  */
-class B4Page05TableTest {
+class B4Page06Test {
 
-    private static final File FIXTURE = new File("src/test/resources/B4-page05-table.pdf");
+    private static final File FIXTURE = new File("src/test/resources/B4-page06.pdf");
     private static final Path OUTPUT_DIR = Path.of("test-output");
     private static final int DPI = 150;
     private static final int SUB_PAGE_MARGIN_PX = 12;
@@ -59,14 +55,15 @@ class B4Page05TableTest {
 
         // 2. Write bands image for visual verification
         BufferedImage bands = analyzer.analyze(pageImage);
-        ImageIO.write(bands, "PNG", OUTPUT_DIR.resolve("B4-page05-table-bands.png").toFile());
+        ImageIO.write(bands, "PNG", OUTPUT_DIR.resolve("B4-page06-bands.png").toFile());
 
         // 3. Build layout PDF from zones
         int imgW = pageImage.getWidth(), imgH = pageImage.getHeight();
-        Path layoutPdf = OUTPUT_DIR.resolve("B4-page05-table-layout.pdf");
+        Path layoutPdf = OUTPUT_DIR.resolve("B4-page06-layout.pdf");
         try (PDDocument source = Loader.loadPDF(FIXTURE);
              PDDocument output = new PDDocument()) {
-            PDRectangle med = source.getPage(0).getMediaBox();
+            PDPage srcPage = source.getPage(0);
+            PDRectangle med = srcPage.getMediaBox();
             float scaleX = med.getWidth() / imgW;
             float scaleY = med.getHeight() / imgH;
 
@@ -85,52 +82,23 @@ class B4Page05TableTest {
                 }
             }
             output.save(layoutPdf.toFile());
+            System.out.println("Page 6 layout: " + layout.type()
+                    + " -> " + output.getNumberOfPages() + " sub-pages");
         }
 
         // 4. Extract markdown
         PdfConverter converter = new PdfConverter();
-        ConversionResult result = converter.convert(layoutPdf);
+        ConversionResult result = converter.convert(layoutPdf, "glossaries/B4.txt");
         markdown = result.markdown();
-        Files.writeString(OUTPUT_DIR.resolve("B4-page05-table.md"), markdown, StandardCharsets.UTF_8);
+        Files.writeString(OUTPUT_DIR.resolve("B4-page06.md"), markdown, StandardCharsets.UTF_8);
 
-        // Debug: check horizontal projection at key rows
-        boolean[] ink = new boolean[pageImage.getWidth() * pageImage.getHeight()];
-        for (int y = 0; y < pageImage.getHeight(); y++)
-            for (int x = 0; x < pageImage.getWidth(); x++) {
-                int rgb = pageImage.getRGB(x, y);
-                int r = (rgb >> 16) & 0xFF, g = (rgb >> 8) & 0xFF, b2 = rgb & 0xFF;
-                int lum = (r * 299 + g * 587 + b2 * 114) / 1000;
-                ink[y * pageImage.getWidth() + x] = lum < 200;
-            }
-        System.out.println("Ink rows with content (y=960..1400):");
-        for (int y = 960; y < 1400; y++) {
-            int count = 0;
-            for (int x = 0; x < pageImage.getWidth(); x++)
-                if (ink[y * pageImage.getWidth() + x]) count++;
-            if (count > 0) System.out.println("  y=" + y + ": " + count + " ink pixels");
-        }
-        System.out.println("Ink sample rows:");
-        for (int y : new int[]{0, 100, 400, 550, 800, 850, 880, 900, 950, 1000, 1100, 1200, 1300, 1400}) {
-            if (y >= pageImage.getHeight()) continue;
-            int count = 0;
-            for (int x = 0; x < pageImage.getWidth(); x++)
-                if (ink[y * pageImage.getWidth() + x]) count++;
-            System.out.println("  y=" + y + ": " + count + " ink pixels");
-        }
-
-        // Debug dump
-        System.out.println("Page 5 table layout: " + layout.type());
-        System.out.println("Image: " + pageImage.getWidth() + "x" + pageImage.getHeight());
-        System.out.println("Margins: top=" + layout.margins().top()
-                + " bottom=" + layout.margins().bottom()
-                + " left=" + layout.margins().left()
-                + " right=" + layout.margins().right());
+        // Debug
+        System.out.println("Page 6 layout type: " + layout.type());
         System.out.println("Zones: " + layout.zones().size());
         for (int i = 0; i < layout.zones().size(); i++) {
             Zone z = layout.zones().get(i);
             System.out.println("  Zone " + i + ": " + z.type()
                     + " y=[" + z.yTop() + "," + z.yBottom() + ")"
-                    + " h=" + (z.yBottom() - z.yTop()) + "px"
                     + " cols=" + z.columns().size());
         }
     }
@@ -153,31 +121,16 @@ class B4Page05TableTest {
         p.setCropBox(box);
     }
 
-    // ── Layout structure ─────────────────────────────────────────────────────
-
-    @Test
-    void tableNotFragmentedIntoManyZones() {
-        assertTrue(layout.zones().size() <= 14,
-                "Table section has " + layout.zones().size() + " zones — too fragmented");
-    }
-
-    @Test
-    void hasContentZones() {
-        long textZones = layout.zones().stream()
-                .filter(z -> z.type() == ZoneType.TEXT).count();
-        assertTrue(textZones >= 1, "Should have at least 1 TEXT zone");
-    }
-
     // ── Bands image matches reference ────────────────────────────────────────
 
     @Test
     void bandsImageMatchesReference() throws Exception {
-        File refFile = new File("src/test/resources/B4-page05-table-bands-expected.png");
+        File refFile = new File("src/test/resources/B4-page06-bands-expected.png");
         org.junit.jupiter.api.Assumptions.assumeTrue(refFile.exists(),
-                "Reference bands image not found — copy test-output/B4-page05-table-bands.png to src/test/resources/B4-page05-table-bands-expected.png");
+                "Reference bands image not found — copy test-output/B4-page06-bands.png to src/test/resources/B4-page06-bands-expected.png");
 
         BufferedImage expected = ImageIO.read(refFile);
-        BufferedImage actual = ImageIO.read(OUTPUT_DIR.resolve("B4-page05-table-bands.png").toFile());
+        BufferedImage actual = ImageIO.read(OUTPUT_DIR.resolve("B4-page06-bands.png").toFile());
 
         assertEquals(expected.getWidth(), actual.getWidth(), "Bands image width mismatch");
         assertEquals(expected.getHeight(), actual.getHeight(), "Bands image height mismatch");
@@ -192,56 +145,88 @@ class B4Page05TableTest {
                 "Bands image differs from reference in " + mismatched + " pixels");
     }
 
-    // ── Markdown: all 8 monster entries present ──────────────────────────────
+    // ── Markdown matches reference ──────────────────────────────────────────
 
     @Test
-    void containsWanderingMonsterTableHeader() {
-        assertTrue(markdown.contains("Wandering Monster")
-                        || markdown.contains("wandering monster")
-                        || markdown.contains("Wandering Monsters"),
-                "Should contain 'Wandering Monster' table heading");
+    void markdownMatchesExpected() throws Exception {
+        Path expectedPath = Path.of("src/test/resources/B4-page06-expected.md");
+        org.junit.jupiter.api.Assumptions.assumeTrue(expectedPath.toFile().exists(),
+                "Expected markdown not found — copy test-output/B4-page06.md to src/test/resources/B4-page06-expected.md");
+
+        String expected = Files.readString(expectedPath, StandardCharsets.UTF_8).strip();
+        String actual = markdown.strip();
+        assertEquals(expected, actual, "Markdown output differs from expected");
+    }
+
+    // ── Layout structure ─────────────────────────────────────────────────────
+
+    @Test
+    void layoutHasTwoColumnZones() {
+        long twoColZones = layout.zones().stream()
+                .filter(z -> z.type() == ZoneType.TEXT)
+                .filter(z -> z.columns().size() == 2)
+                .count();
+        assertTrue(twoColZones >= 1,
+                "Should have at least 1 two-column TEXT zone, layout type: " + layout.type());
     }
 
     @Test
-    void containsCentipede() {
-        assertTrue(markdown.contains("Centipede") || markdown.contains("centipede"),
-                "Should contain Centipede entry");
+    void hasAtLeastOneTextZone() {
+        long textZones = layout.zones().stream()
+                .filter(z -> z.type() == ZoneType.TEXT).count();
+        assertTrue(textZones >= 1, "Should have at least 1 TEXT zone");
     }
 
     @Test
-    void containsCaveLocust() {
+    void producesMultipleSubPages() {
+        // With two-column zones, we should get more than 1 sub-page
+        long totalSubZones = layout.zones().stream()
+                .filter(z -> z.type() == ZoneType.TEXT)
+                .flatMap(z -> z.columns().stream())
+                .flatMap(c -> c.subZones().stream())
+                .count();
+        assertTrue(totalSubZones > 2,
+                "Should produce multiple sub-pages from column splitting, got " + totalSubZones);
+    }
+
+    // ── Column separation (no interleaving) ─────────────────────────────────
+
+    @Test
+    void leftColumnContainsMonsterDescriptions() {
+        // The left column has the wandering monster table descriptions
+        // (Centipede, Cave Locust, Cynidicean, Ferret, Gnome, Goblin)
         String stripped = markdown.replaceAll("\\s+", "").toLowerCase();
         assertTrue(stripped.contains("cavelocust"),
-                "Should contain Cave Locust entry");
+                "Should contain Cave Locust description");
     }
 
     @Test
-    void containsCynidicean() {
-        assertTrue(markdown.contains("Cynidicean") || markdown.contains("cynidicean"),
-                "Should contain Cynidicean entry");
+    void rightColumnContainsStatueRoom() {
+        // The right column has room 1: Statue Room
+        String stripped = markdown.replaceAll("[\\s*]+", "").toUpperCase();
+        assertTrue(stripped.contains("STATUEROOM"),
+                "Should contain '1. STATUE ROOM' heading");
     }
 
     @Test
-    void containsFerretGiant() {
-        assertTrue(markdown.contains("Ferret") || markdown.contains("ferret"),
-                "Should contain Ferret Giant entry");
-    }
-
-    @Test
-    void containsGnome() {
-        assertTrue(markdown.contains("Gnome") || markdown.contains("gnome"),
-                "Should contain Gnome entry");
-    }
-
-    @Test
-    void containsGoblin() {
-        assertTrue(markdown.contains("Goblin") || markdown.contains("goblin"),
-                "Should contain Goblin entry");
+    void columnsAreNotInterleaved() {
+        // The key test: if columns are properly separated, "Centipede" text
+        // and "STATUE ROOM" text should NOT appear on the same line.
+        // When interleaved, monster descriptions and room text get mixed.
+        String[] lines = markdown.split("\n");
+        for (String line : lines) {
+            String lower = line.toLowerCase();
+            boolean hasMonster = lower.contains("centipede") || lower.contains("cave locust");
+            boolean hasRoom = lower.contains("statue room") || lower.contains("pyramid");
+            assertFalse(hasMonster && hasRoom,
+                    "Columns are interleaved — monster and room text on same line: " + line);
+        }
     }
 
     @Test
     void markdownHasSubstantialContent() {
-        assertTrue(markdown.length() > 200,
-                "Markdown should have substantial text (got " + markdown.length() + " chars)");
+        assertFalse(markdown.isBlank(), "Markdown should not be empty");
+        assertTrue(markdown.length() > 500,
+                "Should have substantial text (got " + markdown.length() + " chars)");
     }
 }

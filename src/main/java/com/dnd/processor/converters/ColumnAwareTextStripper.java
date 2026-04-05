@@ -1127,17 +1127,32 @@ public class ColumnAwareTextStripper {
                     super.writeString(text, textPositions);
                     return;
                 }
-                String fontName = textPositions.get(0).getFont().getName();
-                boolean bold   = isBoldFont(fontName);
-                boolean italic = isItalicFont(fontName);
-                if (bold && italic) {
-                    writeString("***" + text + "***");
-                } else if (bold) {
-                    writeString("**" + text + "**");
-                } else if (italic) {
-                    writeString("*" + text + "*");
-                } else {
-                    super.writeString(text, textPositions);
+                // Split the text run at font-style boundaries so bold/italic
+                // markers wrap only the characters that actually use that style.
+                // textPositions and text are parallel (index i → character i).
+                int len = Math.min(text.length(), textPositions.size());
+                int start = 0;
+                while (start < len) {
+                    String startFont = textPositions.get(start).getFont().getName();
+                    boolean startBold = isBoldFont(startFont);
+                    boolean startItalic = isItalicFont(startFont);
+                    int end = start + 1;
+                    while (end < len) {
+                        String f = textPositions.get(end).getFont().getName();
+                        if (isBoldFont(f) != startBold || isItalicFont(f) != startItalic) break;
+                        end++;
+                    }
+                    String span = text.substring(start, end < len ? end : text.length());
+                    if (startBold && startItalic) {
+                        writeString("***" + span + "***");
+                    } else if (startBold) {
+                        writeString("**" + span + "**");
+                    } else if (startItalic) {
+                        writeString("*" + span + "*");
+                    } else {
+                        writeString(span);
+                    }
+                    start = end;
                 }
             }
             @Override

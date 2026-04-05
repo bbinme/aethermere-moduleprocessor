@@ -23,28 +23,27 @@ public class PdfConverter {
             "^[A-Z][A-Z\\s'\",:;!?-]{2,}(?:\\s+[A-Z]+){2,}$"
     );
 
-    // Room number pattern: digit(s), optional letter, period, space, capital letter
+    // Room heading: number + ALL CAPS name (e.g. "1. STATUE ROOM", "5a. POTTERY JARS")
     private static final Pattern ROOM_NUMBER = Pattern.compile(
-            "^(\\d+[A-Z]?\\.\\s+[A-Z].*)$"
+            "^\\d+[a-zA-Z]?\\.\\s+[A-Z][A-Z']+(?:\\s+[A-Z][A-Z']+)*$"
     );
 
     private final ColumnAwareTextStripper columnAwareStripper = new ColumnAwareTextStripper();
     private final RulesetDetector rulesetDetector = new RulesetDetector();
     private final StatBlockDetector statBlockDetector = new StatBlockDetector();
 
-    /**
-     * Converts the given PDF file to a Markdown string, also detecting the ruleset.
-     *
-     * @param inputPath path to the PDF file
-     * @return conversion result containing Markdown and the detected ruleset
-     */
+    public ConversionResult convert(Path inputPath) throws IOException {
+        return convert(inputPath, null);
+    }
+
     /**
      * Converts a layout-preprocessed PDF to Markdown.
-     * Each page is expected to already be a single-column sub-page produced by
-     * the layout phase.  Text is extracted using the page's MediaBox as the
-     * region, which naturally clips to the pre-split content area.
+     *
+     * @param inputPath path to the PDF file
+     * @param glossary  optional glossary resource path (e.g. "glossaries/B4.txt")
+     *                  for module-specific terms used during fragment reconstruction
      */
-    public ConversionResult convert(Path inputPath) throws IOException {
+    public ConversionResult convert(Path inputPath, String glossary) throws IOException {
         List<String> pageTexts = new ArrayList<>();
         RulesetInfo ruleset;
 
@@ -64,7 +63,16 @@ public class PdfConverter {
             fullText.append(pageTexts.get(i));
         }
 
-        String withFences = statBlockDetector.markStatBlocks(fullText.toString());
+        FragmentCleaner fragmentCleaner = new FragmentCleaner(120, glossary);
+
+        List<String> unknownWords = fragmentCleaner.findUnknownWords(fullText.toString());
+        if (!unknownWords.isEmpty()) {
+            System.out.println("[glossary] " + unknownWords.size()
+                    + " unknown words found: " + unknownWords);
+        }
+
+        String cleaned = fragmentCleaner.clean(fullText.toString());
+        String withFences = statBlockDetector.markStatBlocks(cleaned);
         String markdown = toMarkdown(withFences);
         return new ConversionResult(markdown, ruleset);
     }
@@ -154,7 +162,9 @@ public class PdfConverter {
      * Lines inside ```stat fences are passed through unchanged.
      */
     private String toMarkdown(String rawText) {
-        String[] lines = rawText.split("\n", -1);
+        // Pre-split lines that contain embedded room headings
+        String presplit = splitEmbeddedHeadings(rawText);
+        String[] lines = presplit.split("\n", -1);
         StringBuilder sb = new StringBuilder();
         boolean inFence = false;
 
@@ -214,5 +224,57 @@ public class PdfConverter {
     private boolean isAllCapsHeading(String line) {
         if (!line.equals(line.toUpperCase())) return false;
         return line.trim().split("\\s+").length >= 3;
+    }
+
+    /**
+     * Splits lines that contain embedded room headings.
+     * E.g. "KEY TO TIER 2 2. STORAGE ROOM This room contains..."
+     * becomes three separate lines:
+     *   "KEY TO TIER 2"
+     *   "2. STORAGE ROOM"
+     *   "This room contains..."
+     */
+    private String splitEmbeddedHeadings(String text) {
+        // Pattern: room number heading embedded in a line
+        // Matches "N. ROOM NAME" where N is digits + optional letter
+        // Match room heading: "N. ROOM NAME" where name is ALL CAPS words (2+ chars each),
+        // stopping before any single uppercase letter followed by lowercase.
+        Pattern embeddedRoom = Pattern.compile(
+                "(\\d+[a-zA-Z]?\\.\\s+(?:[A-Z][A-Z']+(?:\\s+|$))*[A-Z][A-Z']+)(?=\\s|$)");
+
+        String[] lines = text.split("\n", -1);
+        StringBuilder result = new StringBuilder();
+
+        for (String line : lines) {
+            String bare = line.trim().replaceAll("\\*+", "").trim();
+            java.util.regex.Matcher m = embeddedRoom.matcher(bare);
+
+            if (m.find()) {
+                String before = bare.substring(0, m.start()).trim();
+                String heading = m.group(1).trim();
+                String after = bare.substring(m.end()).trim();
+
+                // Only split if there's text before or after the heading
+                if (before.isEmpty() && after.isEmpty()) {
+                    result.append(line).append("\n");
+                } else {
+                    if (!before.isEmpty()) {
+                        result.append(before).append("\n");
+                    }
+                    result.append(heading).append("\n");
+                    if (!after.isEmpty()) {
+                        result.append(after).append("\n");
+                    }
+                }
+            } else {
+                result.append(line).append("\n");
+            }
+        }
+
+        // Remove trailing extra newline added by the loop
+        if (result.length() > 0 && result.charAt(result.length() - 1) == '\n') {
+            result.setLength(result.length() - 1);
+        }
+        return result.toString();
     }
 }
