@@ -62,6 +62,7 @@ public class ProjectionAnalyzer {
     private final int   FOOTER_EXTRA_CLUSTER_MAX_PX;
     private final int   FOOTER_EXTRA_PASSES;
     private final int   FOOTER_TINY_CLUSTER_MAX_PX;
+    private final int   BOTTOM_MARGIN_PADDING_PX;
     private final int   MIN_ROW_SPLIT_PX;
     private final int   MIN_TABLE_HORIZ_GAPS;
     private final float MIN_MAP_INK_FRACTION;
@@ -94,6 +95,7 @@ public class ProjectionAnalyzer {
         FOOTER_EXTRA_CLUSTER_MAX_PX    = config.footerExtraClusterMaxPx();
         FOOTER_EXTRA_PASSES            = config.footerExtraPasses();
         FOOTER_TINY_CLUSTER_MAX_PX     = config.footerTinyClusterMaxPx();
+        BOTTOM_MARGIN_PADDING_PX       = config.bottomMarginPaddingPx();
         MIN_ROW_SPLIT_PX               = config.minRowSplitPx();
         MIN_TABLE_HORIZ_GAPS           = config.minTableHorizGaps();
         MIN_MAP_INK_FRACTION           = config.minMapInkFraction();
@@ -113,7 +115,7 @@ public class ProjectionAnalyzer {
     public enum LayoutType { SINGLE, MAP, TABLE, TWO_COLUMN, THREE_COLUMN, TWO_ROW, THREE_ROW, TWO_BY_TWO, FRONT_COVER, BACK_COVER }
 
     /** Whether a zone contains typeset text or an illustration/map. */
-    public enum ZoneType { TEXT, IMAGE }
+    public enum ZoneType { TEXT, IMAGE, TABLE }
 
     /**
      * A vertical slice within a column: either a text run (with blank-line gaps)
@@ -519,6 +521,25 @@ public class ProjectionAnalyzer {
             }
         }
 
+        // Post-process: absorb a short TEXT zone that follows a TABLE zone.
+        // The last table row may fall just past the gap boundary and end up as a
+        // separate TEXT zone.  Merge it back into the TABLE if it's short enough
+        // (shorter than the average table content run).
+        for (i = 0; i < rows.size() - 1; i++) {
+            Zone tbl  = rows.get(i);
+            Zone next = rows.get(i + 1);
+            if (tbl.type() == ZoneType.TABLE && next.type() == ZoneType.TEXT
+                    && next.yBottom() - next.yTop() < MIN_ROW_SPLIT_PX) {
+                // Rebuild the TABLE zone with the extended range
+                Zone merged = buildTextZone(ink, w, h, m, tbl.yTop(), next.yBottom());
+                rows.set(i, merged);
+                rows.remove(i + 1);
+                log.debug("[table absorb] merged trailing TEXT [{},{}) into TABLE → [{},{})",
+                        next.yTop(), next.yBottom(), tbl.yTop(), next.yBottom());
+                i--; // re-check in case there are more trailing zones
+            }
+        }
+
         return rows;
     }
 
@@ -593,6 +614,36 @@ public class ProjectionAnalyzer {
             return new Zone(yTop, yBottom, ZoneType.TEXT,
                     List.of(new Column(m.left(), m.right(),
                             List.of(new ColumnZone(yTop, yBottom, ZoneType.TEXT, hGaps)))));
+        }
+
+        // Table detection: a table has many short content runs (data rows)
+        // separated by gaps.  Normal text has fewer, taller paragraph runs.
+        // Criteria: 3+ gaps, AND most content runs are shorter than MIN_ROW_SPLIT_PX.
+        {
+            int[] horizProjTable = horizontalProjection(ink, w, h, m.left(), m.right());
+            int maxInkForGap = Math.max(1, (int)((m.right() - m.left()) * MAX_INK_FRACTION));
+            List<int[]> tableGaps = findGaps(horizProjTable, yTop, yBottom, maxInkForGap, MIN_HORIZ_GAP_PX);
+            if (tableGaps.size() >= 3) {
+                // Check that content runs between gaps are short (table rows, not paragraphs)
+                List<int[]> contentRuns = new ArrayList<>();
+                int cursor = yTop;
+                for (int[] g : tableGaps) {
+                    if (g[0] > cursor) contentRuns.add(new int[]{cursor, g[0]});
+                    cursor = g[1];
+                }
+                if (yBottom > cursor) contentRuns.add(new int[]{cursor, yBottom});
+
+                long shortRuns = contentRuns.stream()
+                        .filter(r -> r[1] - r[0] < MIN_ROW_SPLIT_PX)
+                        .count();
+                if (shortRuns >= 3 && shortRuns > contentRuns.size() / 2) {
+                    log.debug("[table detect] zone [{},{}) has {} gaps, {}/{} short runs",
+                            yTop, yBottom, tableGaps.size(), shortRuns, contentRuns.size());
+                    return new Zone(yTop, yBottom, ZoneType.TABLE,
+                            List.of(new Column(m.left(), m.right(),
+                                    List.of(new ColumnZone(yTop, yBottom, ZoneType.TABLE, tableGaps)))));
+                }
+            }
         }
 
         // Pass 1: find column gutters in this zone only.
@@ -784,6 +835,20 @@ public class ProjectionAnalyzer {
                 // Orange: illustration / map zone
                 g2.setColor(Color.ORANGE);
                 g2.drawRect(m.left(), zt, m.right() - m.left(), zh);
+            } else if (zone.type() == ZoneType.TABLE) {
+                // Magenta: table zone boundary
+                g2.setColor(Color.MAGENTA);
+                g2.drawRect(m.left(), zt, m.right() - m.left(), zh);
+                // Pink: table row gaps (horizontal rules / data row separators)
+                g2.setColor(new Color(255, 105, 180)); // hot pink
+                for (Column col : zone.columns()) {
+                    for (ColumnZone cz : col.subZones()) {
+                        for (int[] gap : cz.horizGaps()) {
+                            g2.drawRect(col.xLeft(), gap[0],
+                                    col.xRight() - col.xLeft(), gap[1] - gap[0]);
+                        }
+                    }
+                }
             } else {
                 List<Column> cols = zone.columns();
                 // Red: column gutters (between adjacent columns, full zone height)
@@ -877,7 +942,7 @@ public class ProjectionAnalyzer {
             // Nothing meaningful in the bottom third — simple last-ink scan
             lastInkRow = h - 1;
             while (lastInkRow > contentTop && horizProj[lastInkRow] < MIN_INK_FOR_CONTENT) lastInkRow--;
-            return lastInkRow;
+            return Math.min(h - 1, lastInkRow + BOTTOM_MARGIN_PADDING_PX);
         }
 
         // Step 2: find the top of the bottom cluster (border, page number, etc.)
@@ -885,7 +950,7 @@ public class ProjectionAnalyzer {
         while (clusterTop > searchFrom && horizProj[clusterTop] >= MIN_INK_FOR_CONTENT) clusterTop--;
         int clusterHeight = lastInkRow - clusterTop;
 
-        if (clusterHeight > FOOTER_CLUSTER_MAX_PX) return lastInkRow;
+        if (clusterHeight > FOOTER_CLUSTER_MAX_PX) return Math.min(h - 1, lastInkRow + BOTTOM_MARGIN_PADDING_PX);
 
         // Step 3: find the first gap above the bottom cluster.
         int gapEnd   = clusterTop;
@@ -893,16 +958,17 @@ public class ProjectionAnalyzer {
         while (gapStart > searchFrom && horizProj[gapStart] < MIN_INK_FOR_CONTENT) gapStart--;
         int firstGapHeight = gapEnd - gapStart;
 
-        if (firstGapHeight < FOOTER_FIRST_GAP_MIN_PX) return lastInkRow;
+        if (firstGapHeight < FOOTER_FIRST_GAP_MIN_PX) return Math.min(h - 1, lastInkRow + BOTTOM_MARGIN_PADDING_PX);
 
         // If the first gap is already large enough to confirm a content/footer
         // boundary, everything above it is content — don't absorb further.
         // The iterative loop below handles cases where the first gap is small
         // (e.g. page number + ornamental rule with a narrow gap between them).
         if (firstGapHeight >= FOOTER_CONTENT_GAP_MIN_PX) {
+            int boundary = Math.min(h - 1, gapStart + BOTTOM_MARGIN_PADDING_PX);
             log.debug("[footer] first gap {}px confirms boundary at y={}",
-                    firstGapHeight, gapStart);
-            return gapStart;
+                    firstGapHeight, boundary);
+            return boundary;
         }
 
         // Step 4: iteratively absorb small footer elements above the first gap.
@@ -931,7 +997,7 @@ public class ProjectionAnalyzer {
                 break;
             }
         }
-        return boundary;
+        return Math.min(h - 1, boundary + BOTTOM_MARGIN_PADDING_PX);
     }
 
     // ── Projection helpers ────────────────────────────────────────────────────
@@ -1118,43 +1184,56 @@ public class ProjectionAnalyzer {
     private List<int[]> rescueContentInGaps(List<int[]> gaps, int[] horizProj, int maxInk) {
         List<int[]> result = new ArrayList<>();
         for (int[] gap : gaps) {
-            // Find the longest content run inside the gap
-            int bestStart = -1, bestEnd = -1, bestLen = 0;
+            // Find ALL content runs inside the gap
+            List<int[]> contentRuns = new ArrayList<>();
             int runStart = -1;
             for (int y = gap[0]; y <= gap[1]; y++) {
                 boolean hasInk = y < gap[1] && horizProj[y] > maxInk;
                 if (hasInk) {
                     if (runStart < 0) runStart = y;
-                } else {
-                    if (runStart >= 0) {
-                        int len = y - runStart;
-                        if (len > bestLen) {
-                            bestStart = runStart;
-                            bestEnd = y;
-                            bestLen = len;
-                        }
-                        runStart = -1;
+                } else if (runStart >= 0) {
+                    if (y - runStart >= MIN_HORIZ_GAP_PX) {
+                        contentRuns.add(new int[]{runStart, y});
                     }
+                    runStart = -1;
                 }
             }
-            if (bestLen >= MIN_HORIZ_GAP_PX) {
-                // Split: gap before content + gap after content
-                if (bestStart - gap[0] >= MIN_HORIZ_GAP_PX) {
-                    result.add(new int[]{gap[0], bestStart});
-                }
-                if (gap[1] - bestEnd >= MIN_HORIZ_GAP_PX) {
-                    result.add(new int[]{bestEnd, gap[1]});
-                }
-                // If neither sub-gap is large enough, keep the original gap
-                if (bestStart - gap[0] < MIN_HORIZ_GAP_PX
-                        && gap[1] - bestEnd < MIN_HORIZ_GAP_PX) {
-                    result.add(gap);
-                }
-                log.debug("[rescue] content [{},{}) found inside gap [{},{})",
-                        bestStart, bestEnd, gap[0], gap[1]);
-            } else {
+            if (contentRuns.isEmpty()) {
                 result.add(gap);
+                continue;
             }
+            // Table detection: 3+ content runs in one gap = table region.
+            // Keep the entire region from first run to last run as one content
+            // block (gap before + gap after only), so the table isn't fragmented.
+            if (contentRuns.size() >= 3) {
+                int tableStart = contentRuns.get(0)[0];
+                // Extend past last content run to include descenders / trailing pixels
+                int tableEnd   = Math.min(gap[1],
+                        contentRuns.get(contentRuns.size() - 1)[1] + MIN_HORIZ_GAP_PX);
+                if (tableStart - gap[0] >= MIN_HORIZ_GAP_PX) {
+                    result.add(new int[]{gap[0], tableStart});
+                }
+                if (gap[1] - tableEnd >= MIN_HORIZ_GAP_PX) {
+                    result.add(new int[]{tableEnd, gap[1]});
+                }
+                log.debug("[rescue table] {} content runs → single region [{},{}) in gap [{},{}). Runs: {}",
+                        contentRuns.size(), tableStart, tableEnd, gap[0], gap[1],
+                        contentRuns.stream().map(r -> "[" + r[0] + "," + r[1] + ")").toList());
+                continue;
+            }
+
+            // For 1-2 content runs, split the gap into sub-gaps between them
+            int cursor = gap[0];
+            for (int[] run : contentRuns) {
+                if (run[0] - cursor >= MIN_HORIZ_GAP_PX) {
+                    result.add(new int[]{cursor, run[0]});
+                }
+                cursor = run[1];
+            }
+            if (gap[1] - cursor >= MIN_HORIZ_GAP_PX) {
+                result.add(new int[]{cursor, gap[1]});
+            }
+            log.debug("[rescue] {} content runs in gap [{},{})", contentRuns.size(), gap[0], gap[1]);
         }
         return result;
     }

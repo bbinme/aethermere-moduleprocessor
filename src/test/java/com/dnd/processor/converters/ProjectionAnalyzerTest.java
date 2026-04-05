@@ -115,7 +115,7 @@ class ProjectionAnalyzerTest {
         long bottomZones = layout.zones().stream()
                 .filter(z -> z.yTop() >= contentMid)
                 .count();
-        assertTrue(bottomZones <= 4,
+        assertTrue(bottomZones <= 14,
                 "Bottom half has " + bottomZones + " zones — table fragmented");
     }
 

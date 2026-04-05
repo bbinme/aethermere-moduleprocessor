@@ -60,12 +60,12 @@ class ExtractTestPages {
             //   Bottom table:     y=[892, 1400) (wandering monster table)
             // Generous padding avoids clipping text at boundaries.
             extractPageSectionWithLabels(doc, 4, new File(outDir, "B4-page05-top.pdf"),
-                    0, 469, "3", null, "Wandering Monsters");
+                    0, 469, "3", "Players' Background", "Wandering Monsters", 160);
             extractPageSectionWithLabels(doc, 4, new File(outDir, "B4-page05-middle.pdf"),
                     460, 900, "3", "top row of text",
-                    "Wandering");
-            extractPageSection(doc, 4, new File(outDir, "B4-page05-table.pdf"),
-                    880, 1420, "3");
+                    "Wandering", 160);
+            extractPageSectionWithLabels(doc, 4, new File(outDir, "B4-page05-table.pdf"),
+                    895, 1420, "3", "Wandering Monsters", "Room Descriptions", -640);
         }
         System.out.println("Extracted test pages to " + outDir.getAbsolutePath());
     }
@@ -168,7 +168,8 @@ class ExtractTestPages {
     private static void extractPageSectionWithLabels(PDDocument src, int pageIndex, File out,
                                                       int imgTop, int imgBottom,
                                                       String pageNum, String headerLabel,
-                                                      String tableHeading)
+                                                      String bottomLabel, int bottomLabelOffsetPx,
+                                                      String... extraHeaderLabels)
             throws Exception {
         BufferedImage img = new PDFRenderer(src).renderImageWithDPI(pageIndex, DPI, ImageType.RGB);
         int imgH = img.getHeight();
@@ -222,16 +223,31 @@ class ExtractTestPages {
                     cs.endText();
                 }
 
-                // Draw large table heading below the visible section
-                if (tableHeading != null) {
+                // Draw extra header labels below the first one
+                for (int li = 0; li < extraHeaderLabels.length; li++) {
+                    String extra = extraHeaderLabels[li];
+                    float extraFontSize = 14;
+                    float extraWidth = boldFont.getStringWidth(extra) / 1000 * extraFontSize;
+                    float extraPdfY = pageHeight - (30 + 25 * (li + 1)) * scaleY;
+                    cs.beginText();
+                    cs.setFont(boldFont, extraFontSize);
+                    cs.setNonStrokingColor(0f, 0f, 0f);
+                    cs.newLineAtOffset((pageWidth - extraWidth) / 2, extraPdfY);
+                    cs.showText(extra);
+                    cs.endText();
+                }
+
+                // Draw large bold label below the visible section.
+                if (bottomLabel != null) {
                     float headingFontSize = 28;
-                    float headingWidth = boldFont.getStringWidth(tableHeading) / 1000 * headingFontSize;
-                    float headingPdfY = pdfSectionBottom - 150 * scaleY;
+                    float headingWidth = boldFont.getStringWidth(bottomLabel) / 1000 * headingFontSize;
+                    float headingPdfY = Math.max(20,
+                            pageHeight - (imgBottom + bottomLabelOffsetPx) * scaleY);
                     cs.beginText();
                     cs.setFont(boldFont, headingFontSize);
                     cs.setNonStrokingColor(0f, 0f, 0f);
                     cs.newLineAtOffset((pageWidth - headingWidth) / 2, headingPdfY);
-                    cs.showText(tableHeading);
+                    cs.showText(bottomLabel);
                     cs.endText();
                 }
 

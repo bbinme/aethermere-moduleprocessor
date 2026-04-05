@@ -78,6 +78,9 @@ public class DnD_BasicSet {
     /** Clusters ≤ this height are treated as noise/fragment rows unconditionally. */
     public int footerTinyClusterMaxPx() { return 5; }
 
+    /** Pixels of padding added below the last detected ink row for bottom margin. */
+    public int bottomMarginPaddingPx()  { return 3; }
+
     // ── Layout classification ─────────────────────────────────────────────────
 
     /**
