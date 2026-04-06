@@ -456,8 +456,9 @@ public class ProjectionAnalyzer {
         int maxInkForRowGap = Math.max(1, (int)((m.right() - m.left()) * MAX_INK_FRACTION));
 
         // ── Pass 1: initial Phase 1 + zone building ─────────────────────────
+        int headingRawMin = Math.max(1, Math.min(13, MIN_ROW_SPLIT_PX / 2));
         List<int[]> breaks = findPhase1Breaks(horizProj, m, illZones,
-                maxInkForRowGap, MIN_ROW_SPLIT_PX, List.of());
+                maxInkForRowGap, MIN_ROW_SPLIT_PX, List.of(), headingRawMin);
         List<Zone> rows = buildZonesFromBreaks(ink, w, h, m, illZones, breaks);
         passZones.add(List.copyOf(rows));
         log.debug("[pass1] {} zones", rows.size());
@@ -669,6 +670,20 @@ public class ProjectionAnalyzer {
                     breaks2.add(new int[]{gapStart, gapEnd, 0});
                     log.debug("[table boundary] placed break at [{},{}) below table [{},{})",
                             gapStart, gapEnd, tb[0], tb[1]);
+                } else {
+                    // No table rows found below — restore the gap between table
+                    // bottom and the first non-table content as a break.
+                    int gapStart = tb[1];
+                    int gapEnd = gapStart;
+                    for (int y = gapStart; y < m.bottom(); y++) {
+                        if (horizProj[y] > maxInkForRowGap) { gapEnd = y; break; }
+                        gapEnd = y + 1;
+                    }
+                    if (gapEnd > gapStart) {
+                        breaks2.add(new int[]{gapStart, gapEnd, 0});
+                        log.debug("[table boundary] placed break at [{},{}) below table [{},{})",
+                                gapStart, gapEnd, tb[0], tb[1]);
+                    }
                 }
             }
 
@@ -696,6 +711,14 @@ public class ProjectionAnalyzer {
                                           List<int[]> illZones,
                                           int maxInkForRowGap, int minGapPx,
                                           List<int[]> protectedZones) {
+        return findPhase1Breaks(horizProj, m, illZones, maxInkForRowGap, minGapPx,
+                protectedZones, Math.max(1, minGapPx / 2));
+    }
+
+    private List<int[]> findPhase1Breaks(int[] horizProj, Margins m,
+                                          List<int[]> illZones,
+                                          int maxInkForRowGap, int minGapPx,
+                                          List<int[]> protectedZones, int rawMin) {
         List<int[]> breaks = new ArrayList<>();
 
         for (int[] ill : illZones) {
@@ -706,16 +729,16 @@ public class ProjectionAnalyzer {
         for (int[] ill : illZones) {
             if (ill[0] > current) {
                 List<int[]> hGaps = findGaps(horizProj, current, ill[0],
-                        maxInkForRowGap, minGapPx);
-                hGaps = rescueContentInGaps(hGaps, horizProj, maxInkForRowGap);
+                        maxInkForRowGap, minGapPx, minGapPx, rawMin);
+                hGaps = rescueContentInGaps(hGaps, horizProj, maxInkForRowGap, minGapPx);
                 for (int[] g : hGaps) breaks.add(new int[]{g[0], g[1], 0});
             }
             current = ill[1];
         }
         if (current < m.bottom()) {
             List<int[]> hGaps = findGaps(horizProj, current, m.bottom(),
-                    maxInkForRowGap, minGapPx);
-            hGaps = rescueContentInGaps(hGaps, horizProj, maxInkForRowGap);
+                    maxInkForRowGap, minGapPx, minGapPx, rawMin);
+            hGaps = rescueContentInGaps(hGaps, horizProj, maxInkForRowGap, minGapPx);
             for (int[] g : hGaps) breaks.add(new int[]{g[0], g[1], 0});
         }
 
@@ -836,6 +859,43 @@ public class ProjectionAnalyzer {
         // bleeding into the gutter.
         if (headerEnd <= yTop || headerEnd < 0) return List.of(zone);
         if (inkRowCount < 3 || (headerEnd - yTop) < MIN_HORIZ_GAP_PX) return List.of(zone);
+
+        // Verify the header ink actually spans the full content width (not just
+        // column text bleeding into the gutter).  A real heading spans ≥ 40% of
+        // content width; gutter bleed is confined near the centre.
+        int contentWidth = m.right() - m.left();
+        int inkLeft = m.right(), inkRight = m.left();
+        for (int y = yTop; y < headerEnd; y++) {
+            for (int x = m.left(); x < m.right(); x++) {
+                if (ink[y * w + x]) {
+                    inkLeft = Math.min(inkLeft, x);
+                    inkRight = Math.max(inkRight, x + 1);
+                }
+            }
+        }
+        float spanFraction = (float)(inkRight - inkLeft) / contentWidth;
+        if (spanFraction < 0.40f) {
+            log.debug("[header split] skipped — ink span {}/{} = {}, too narrow",
+                    inkRight - inkLeft, contentWidth, spanFraction);
+            return List.of(zone);
+        }
+
+        // Check that the gutter itself is densely inked (real header text crosses
+        // the gutter, not just two columns with bleed pixels).
+        int gutterInkRows = 0;
+        int gutterWidth = gapRight - gapLeft;
+        for (int y = yTop; y < headerEnd; y++) {
+            int gutterInk = 0;
+            for (int x = gapLeft; x < gapRight; x++) {
+                if (ink[y * w + x]) gutterInk++;
+            }
+            if (gutterInk > gutterWidth * 0.3f) gutterInkRows++;
+        }
+        if (gutterInkRows < (headerEnd - yTop) * 0.3f) {
+            log.debug("[header split] skipped — gutter ink sparse ({}/{} rows dense)",
+                    gutterInkRows, headerEnd - yTop);
+            return List.of(zone);
+        }
 
         // Split: SINGLE header zone + re-analyzed multi-column body zone.
         int xLeft  = zone.columns().get(0).xLeft();
@@ -1390,14 +1450,18 @@ public class ProjectionAnalyzer {
      */
     private List<int[]> findGaps(int[] proj, int from, int to,
                                   int maxInk, int minWidth) {
-        return findGaps(proj, from, to, maxInk, minWidth, minWidth);
+        return findGaps(proj, from, to, maxInk, minWidth, minWidth, Math.max(1, minWidth / 2));
     }
 
     private List<int[]> findGaps(int[] proj, int from, int to,
                                   int maxInk, int minWidth, int maxBridge) {
+        return findGaps(proj, from, to, maxInk, minWidth, maxBridge, Math.max(1, minWidth / 2));
+    }
+
+    private List<int[]> findGaps(int[] proj, int from, int to,
+                                  int maxInk, int minWidth, int maxBridge, int rawMin) {
         // Pass 1: collect raw fragments with a low size floor so that two small
         // adjacent gaps (each below minWidth) can still merge into a valid gutter.
-        int rawMin = Math.max(1, minWidth / 2);
         List<int[]> raw = new ArrayList<>();
         int start = -1;
         for (int i = from; i < to; i++) {
@@ -1513,6 +1577,10 @@ public class ProjectionAnalyzer {
      * an implicit row between them.
      */
     private List<int[]> rescueContentInGaps(List<int[]> gaps, int[] horizProj, int maxInk) {
+        return rescueContentInGaps(gaps, horizProj, maxInk, 0);
+    }
+
+    private List<int[]> rescueContentInGaps(List<int[]> gaps, int[] horizProj, int maxInk, int minGapPx) {
         List<int[]> result = new ArrayList<>();
         for (int[] gap : gaps) {
             // Find ALL content runs inside the gap
@@ -1553,18 +1621,29 @@ public class ProjectionAnalyzer {
                 continue;
             }
 
-            // For 1-2 content runs, split the gap into sub-gaps between them
+            // For 1-2 content runs, split the gap into sub-gaps between them.
+            // Drop the trailing sub-gap so its content merges into the zone
+            // below (e.g. room headers flow into room descriptions).
+            List<int[]> subGaps = new ArrayList<>();
             int cursor = gap[0];
             for (int[] run : contentRuns) {
                 if (run[0] - cursor >= MIN_HORIZ_GAP_PX) {
-                    result.add(new int[]{cursor, run[0]});
+                    subGaps.add(new int[]{cursor, run[0]});
                 }
                 cursor = run[1];
             }
-            if (gap[1] - cursor >= MIN_HORIZ_GAP_PX) {
-                result.add(new int[]{cursor, gap[1]});
+            // Only add trailing sub-gap if the original gap was NOT a bridge-merged
+            // composite (i.e. it was already ≥ minGapPx before merging).
+            // For bridge-merged gaps, dropping the trailing sub-gap lets the last
+            // content run merge with the zone below.
+            boolean bridgeMerged = minGapPx > 0 && subGaps.stream().noneMatch(g -> g[1] - g[0] >= minGapPx);
+            if (!bridgeMerged && gap[1] - cursor >= MIN_HORIZ_GAP_PX) {
+                subGaps.add(new int[]{cursor, gap[1]});
             }
-            log.debug("[rescue] {} content runs in gap [{},{})", contentRuns.size(), gap[0], gap[1]);
+            result.addAll(subGaps);
+            log.debug("[rescue] {} content runs in gap [{},{}){}",
+                    contentRuns.size(), gap[0], gap[1],
+                    bridgeMerged ? " (trailing sub-gap dropped)" : "");
         }
         return result;
     }

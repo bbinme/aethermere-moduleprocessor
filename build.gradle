@@ -34,6 +34,7 @@ test {
     testLogging {
         showStandardStreams = true
     }
+    systemProperties System.properties.subMap(['phase'])
 }
 
 application {
