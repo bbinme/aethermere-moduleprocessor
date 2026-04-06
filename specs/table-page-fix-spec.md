@@ -1,87 +1,74 @@
 # Table Page Handling — Spec
 
-## Status: Proposed
+## Status: Implemented
 
 ## Problem
 
-Two bugs affect pages dominated by a tabular layout (e.g. B4 wandering monster table):
+Two bugs affect pages with tabular layouts (e.g., B4 wandering monster tables):
 
-### Bug 1 — Bottom margin eats table rows
+### Bug 1 — Bottom margin eats table rows (Fixed)
 
-The green content boundary (bottom margin) is ~100 px too high — the last table row
-("8 Goblin") is excluded from the content area.
+The footer detection algorithm absorbed table rows as footer elements. Fixed by
+adding `BOTTOM_MARGIN_PADDING_PX` and capping iterative absorption.
 
-**Root cause:** `detectBottomMargin` iterates upward absorbing "footer" clusters.
-Table horizontal rules create a repeating pattern of thin ink clusters separated by
-small gaps.  Each table row is ~20-30 px tall with ~5-10 px rule gaps between them.
-`FOOTER_EXTRA_CLUSTER_MAX_PX` (35 px) lets the algorithm absorb table rows as
-"extra footer elements," and `FOOTER_EXTRA_PASSES` (3) means up to 3 rows can be
-consumed, moving the bottom margin ~100 px above the actual last content row.
+### Bug 2 — Row splitting fragments tables (Fixed)
 
-### Bug 2 — Row splitting fragments the table
+Phase 1 row splitting uses `MIN_ROW_SPLIT_PX` (40px for B1_4) to find horizontal
+gaps. Table inter-row gaps can trigger these splits, fragmenting the table.
 
-Phase 1 row splitting treats table horizontal rules as row boundaries (gaps >= 
-`MIN_ROW_SPLIT_PX`).  With `MIN_ROW_SPLIT_PX = 40` (B1-4 config), rules that create
-gaps >= 40 px split the table into tiny rows.  Each tiny row is < 80 px
-(`MIN_ILLUSTRATION_PX`), so the short-row guard applies and each becomes a separate
-single-column zone.  The preprocessor creates separate sub-pages for each tiny row,
-but most are too small and get lost — only "7 Gnome..." survives in output.
-
-Even with `MIN_ROW_SPLIT_PX = 20` (base config), table rules with blank rows above/below
-them can accumulate to >= 20 px gaps.
+Additionally, bridge merging during gap detection can create a merged gap that only
+covers PART of the table — the `rescueContentInGaps` function detects content runs
+inside the gap but can't see rows beyond the gap boundary.
 
 ---
 
-## Fix
+## Fix — Table Retry with Bidirectional Scanning
 
-### Fix 1 — Footer detection guard: minimum content threshold
+Implemented in `ProjectionAnalyzer.buildZones()`:
 
-Before treating the bottom cluster as a footer candidate, check that the content area
-above the proposed boundary still contains substantial content.  If the proposed bottom
-margin would place the content area boundary above the midpoint of the page, do NOT
-absorb — the "footer" is actually content.
+1. **Pass 1**: Normal Phase 1 row splitting + zone building. `buildTextZone()` detects
+   TABLE zones using gap count (3+) and short content run ratio.
 
-Alternative approach: if the page has high horizontal gap density (many horizontal gaps
-in a grid pattern), skip footer absorption entirely — footer detection was designed for
-pages with body text and a page number, not tables.
+2. **Pass 2** (if TABLE zones found): For each detected TABLE zone:
+   - Remove breaks inside/adjacent to the table
+   - **Scan downward**: absorb short, low-density content runs (table rows)
+     until hitting dense paragraph text (ink fraction > 12%)
+   - **Scan upward**: absorb table rows above, skipping over noise pixels
+     and horizontal rules (< 5px tall). Stop at centered title text (>10%
+     margin on both sides) or dense paragraph text
+   - Place new breaks at the extended boundaries
+   - Rebuild zones from modified breaks
 
-**Simpler fix:** In `detectBottomMargin`, after the iterative absorption loop, validate
-that `boundary` is not more than `FOOTER_CLUSTER_MAX_PX` above the first gap top
-(`gapStart`).  If the absorption moved too far up, revert to `gapStart` (the original
-single-footer boundary).  This caps the total footer height while still allowing normal
-page-number + ornament detection.
+### Why Ink Density Works
+Table rows have sparse data spread across the full page width: ink fraction 3-10%.
+Paragraph text (even single lines) has dense text: ink fraction 15-27%.
+The 12% threshold cleanly separates them.
 
-### Fix 2 — Table-aware row splitting
-
-Tables should NOT be row-split.  A table is a single logical unit: many horizontal gaps
-AND many vertical gaps in a grid pattern.
-
-**Detection heuristic:** Before applying Phase 1 row splits, check if the content area
-exhibits a table pattern:
-1. Compute horizontal gaps in the full content area (already done for row splitting)
-2. Compute vertical gaps in the full content area  
-3. If both horizontal gap count >= `MIN_TABLE_HORIZ_GAPS` AND vertical gap count >= 2,
-   treat the content as a table — return a single TEXT zone spanning the full content area
-   with no row splitting.
-
-This check runs early in `buildZones`, before the breaks are assembled.
-
-**Alternative:** Instead of pre-detecting tables, merge fragmented rows post-hoc: if
-row splitting produces many (>= 5?) tiny rows (< `MIN_ILLUSTRATION_PX`) that are all
-single-column, merge them back into one zone.
+### Centered Title Detection
+When scanning upward, short centered text (significant margins on both sides) is
+recognized as the table title. The title is included in the TABLE zone, and scanning
+stops — preventing absorption of headings/text above the table.
 
 ---
 
-## Files to Change
+## Files Changed
 
 | File | Change |
 |------|--------|
-| `ProjectionAnalyzer.java` | Footer absorption limit in `detectBottomMargin`; table-aware guard in `buildZones` |
+| `ProjectionAnalyzer.java` | `buildZones()` — table retry with bidirectional scan; `buildTextZone()` — TABLE zone detection; `renderBands()` — TABLE zone rendering; `findPhase1Breaks()` / `buildZonesFromBreaks()` — extracted from buildZones for multi-pass |
 
 ## Test Cases
 
-- B4 wandering monster table → single zone, all rows visible in layout PDF, "8 Goblin" inside green border
-- B4 page 2 (title page) → unchanged (no table pattern)
-- B4 page 5 (Players' Background + two-col) → unchanged
-- Normal two-column pages → unchanged
-- Pages with genuine footer (page number + ornament) → footer still absorbed correctly
+- B4 page 5 — table at bottom, all rows detected, extends via downward scan
+- B4 page 9 — table in middle of page, rows 6-8 beyond original gap boundary absorbed
+- B4 page 16 — no table (pure two-column text), no false positive
+- B4 page 17 — table split by Phase 1 gap in middle, upward scan recovers top half + title
+
+## Known Limitations
+
+- Table rows with very high ink density (> 12%) may not be absorbed by the scan
+  (e.g., rows with long multi-word entries filling most cells). The current threshold
+  works for all tested B4 wandering monster tables.
+- The centered title detection uses a 10% margin threshold. Very short titles or
+  titles near the left/right edge may not be detected as centered.
+- The scan does not currently handle multi-page tables.

@@ -34,19 +34,38 @@ After margin detection, two sources of breaks divide the content area into rows:
 All breaks are sorted by y-position.  Text regions between breaks become independent rows,
 each receiving its own column detection.
 
+**Phase 1b — Table Retry** (`buildZones`)
+
+After initial zone building, if any TABLE zones were detected, a retry pass runs:
+
+1. For each TABLE zone, scan **downward** absorbing short low-density content runs
+   (additional table rows missed by the initial gap boundary)
+2. Scan **upward** absorbing table rows above, skipping noise/HR pixels (<5px tall)
+3. Stop upward scan at centered title text (>10% margin on both sides) or dense text
+4. Place new breaks at extended boundaries and rebuild zones
+
+This fixes tables split by Phase 1 gaps (e.g., page 17) and tables whose bottom rows
+extend beyond the original merged gap boundary (e.g., page 9 rows 6-8).
+
+See `table-row-detection-spec.md` for full details.
+
 **Phase 2 — Per-Row Column Detection** (`buildTextZone`)
 
 For each text row independently:
 
-1. Short-row guard: rows shorter than `minIllustrationPx` (80px, ~4 text lines at 150 DPI)
+1. **Table detection**: if the zone has 3+ horizontal gaps and majority of content runs
+   between gaps are short (< `minRowSplitPx`), classify as TABLE zone. Table rows have
+   sparse ink (3-10% of width) vs paragraph text (15-27%).
+
+2. Short-row guard: rows shorter than `minIllustrationPx` (80px, ~4 text lines at 150 DPI)
    skip column detection entirely — they cannot contain meaningful multi-column content.
    This prevents false gutters through character/word gaps in headings.
 
-2. Vertical projection restricted to the row's y-range.  Column gutters found using
+3. Vertical projection restricted to the row's y-range.  Column gutters found using
    `findGaps` + `filterIndentGaps` + `mergeSparseBridges` with the strict `maxInkFraction`
    (0.5%) threshold.
 
-3. The strict threshold (0.5%) is safe because row splitting ensures each row contains only
+4. The strict threshold (0.5%) is safe because row splitting ensures each row contains only
    one type of content — no cross-contamination from headings or illustrations.
 
 **Phase 3 — Per-Column Sub-Zone Detection** (unchanged)

@@ -1,37 +1,67 @@
 # Table Row Detection Spec
 
+## Status: Implemented
+
 ## Problem
-The bottom row of a page section containing a table (e.g., B4 page 5 wandering monster table) 
-gets fragmented into many tiny TEXT zones. Each table data row becomes its own zone, losing 
-the table structure. The table should be detected as a single TABLE zone.
+Phase 1 row splitting treats table horizontal rules as row boundaries, fragmenting
+tables into many tiny zones. Additionally, tables can be split in the middle if a
+Phase 1 gap falls between rows, causing only part of the table to be detected.
 
 ## Table Structure
 A table zone has:
-1. **Title** — bold centered text (e.g., "Wandering Monster Table: Level 1")
-2. **Header row** — column headers (e.g., "Die Roll", "Monster", "No", "AC", "HD", etc.)
-3. **Optional horizontal rule** — thin full-width line separating header from body
-4. **Data rows** — sparse text entries aligned to column positions, separated by horizontal rules
-5. Some rows (3rd, 4th, 5th) have cells spanning multiple columns
+1. **Title** — centered text (e.g., "Wandering Monster Table: Level 1")
+2. **Header row** — column headers (e.g., "Die Roll", "Monster", "No", "AC", etc.)
+3. **Optional horizontal rules** — thin full-width lines separating header from body
+4. **Data rows** — sparse text entries aligned to column positions
+5. Some rows have cells spanning multiple columns or wrapping to two lines
 
-## Detection Approach
-After rescuing content runs from a merged gap, check if the pattern matches a table:
+## Detection Approach — Two Phases
 
-1. **Pattern check** — if a gap contained 3+ rescued content runs with consistent spacing,
-   this is likely a table region
-2. **Row gap calculation** — for horizontal rules within the table:
-   - Calculate gaps ABOVE the rule (between previous data row and the rule)
-   - Calculate gaps BELOW the rule (between the rule and next data row)
-   - These gaps should be consistent across the table
-3. **Table zone creation** — instead of fragmenting into individual row zones, create a 
-   single TABLE zone spanning from title through last data row
+### Phase 1: Initial TABLE Detection (in `buildTextZone`)
+After Phase 1 row splitting, each zone is analyzed in `buildTextZone()`:
+- Find horizontal gaps >= `MIN_HORIZ_GAP_PX` (5px) within the zone
+- If 3+ gaps exist AND majority of content runs between gaps are short
+  (< `MIN_ROW_SPLIT_PX` = 40px), classify as TABLE zone
+- This catches tables that fit entirely within one Phase 1 row
 
-## Implementation
-In `buildZones()` — after `rescueContentInGaps`, detect sequences of closely-spaced content 
-runs (separated by gaps < some threshold) and merge them into a single content region. 
-This prevents the table from being split into 8+ tiny zones.
+### Phase 2: Table Retry with Bidirectional Scanning (in `buildZones`)
+After initial zone building, if any TABLE zones were detected:
 
-The zone type should be TABLE (or TEXT with table metadata) so downstream processing 
-can extract the table structure.
+1. **Remove adjacent breaks** — breaks inside or near the TABLE zone are removed
+2. **Scan downward** from table bottom, absorbing content runs that look like
+   additional table rows:
+   - Short height (< `MIN_ROW_SPLIT_PX * 2` = 80px)
+   - Low ink density (< 12% of content width) — table rows are sparse data
+     across the full width; paragraph text is 15-27% dense
+   - Very short runs (< `MIN_HORIZ_GAP_PX`) are skipped as noise/HRs
+   - Stop when a dense content run is encountered (paragraph text)
+3. **Scan upward** from table top, absorbing content runs above:
+   - Same height and ink density checks as downward scan
+   - Very short runs (noise pixels, horizontal rules) are skipped over
+   - **Centered title detection**: if a content run has >10% margin on both
+     left and right sides, it's the table title — include it and stop scanning
+   - Stop when dense paragraph text or the title is found
+4. Place new breaks at the extended table boundaries
+5. Rebuild zones from the modified break list
 
-## Affected Tests
-- `B4Page05TableTest` — all 8 monster entry tests pass, fragmentation test needs table awareness
+## Key Thresholds
+| Threshold | Value | Purpose |
+|-----------|-------|---------|
+| `MIN_HORIZ_GAP_PX` | 5px | Minimum gap to detect table inter-row spacing |
+| `MIN_ROW_SPLIT_PX` | 40px (B1_4) | Phase 1 gap threshold; also max "short" run |
+| Max table row height | 80px | Content runs taller than this aren't table rows |
+| Max ink fraction | 0.12 | Table rows: 3-10%; paragraph text: 15-27% |
+| Min margin for centered | 10% | Both sides must have >10% margin for title detection |
+
+## Test Coverage
+- `B4Page05Test` — wandering monster table at bottom of page (Level 1)
+- `B4Page09Test` — table in middle with two-column text above and below (Level 2)
+- `B4Page17Test` — table split by Phase 1 gap; tests upward scan + title detection (Level 3)
+- `B4Page16Test` — no table page (negative test, no false positives)
+
+## Debug Visualization
+Test classes generate per-pass band images (`B4-pageNN-bands-P1.png`, `P2.png`):
+- **Magenta fill + thick border** — TABLE zone with red line at bottom boundary
+- **Blue fill** — TEXT zone with 2+ columns
+- **Green fill** — TEXT zone with 1 column
+- **Cyan rectangles** — Phase 1 break gaps between zones
