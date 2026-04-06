@@ -21,16 +21,14 @@ import java.nio.file.Path;
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * Tests for B4 page 9 — a page with a wandering monster table at the top
- * and two-column text below.  This exercises TABLE zone detection and
- * verifies that table rows don't bleed into the text zone beneath.
+ * Tests for B4 page 5.
  *
- * Writes bands image, layout PDF, and markdown to {@code test-output/}
+ * Writes bands images, layout PDF, and markdown to {@code test-output/}
  * for visual verification.
  */
-class B4Page09Test {
+class B4Page05Test {
 
-    private static final File FIXTURE = new File("src/test/resources/B4-page09.pdf");
+    private static final File FIXTURE = new File("src/test/resources/B4-page05.pdf");
     private static final Path OUTPUT_DIR = Path.of("test-output");
     private static final int DPI = 150;
     private static final int SUB_PAGE_MARGIN_PX = 12;
@@ -56,20 +54,17 @@ class B4Page09Test {
 
         // 2. Write bands images for each pass
         BufferedImage bands = analyzer.analyze(pageImage);
-        ImageIO.write(bands, "PNG", OUTPUT_DIR.resolve("B4-page09-bands.png").toFile());
+        ImageIO.write(bands, "PNG", OUTPUT_DIR.resolve("B4-page05-bands.png").toFile());
 
-        // Write per-pass bands with filled overlays for visual clarity
         var passes = analyzer.getPassZones();
         for (int pi = 0; pi < passes.size(); pi++) {
             BufferedImage passBands = analyzer.renderBands(pageImage, layout.margins(), passes.get(pi));
 
-            // Add fills so zone types are unmistakable
             java.awt.Graphics2D g2 = passBands.createGraphics();
             int ml = layout.margins().left(), mr = layout.margins().right();
             for (Zone z : passes.get(pi)) {
                 int zt = z.yTop(), zh = z.yBottom() - z.yTop();
                 if (z.type() == ZoneType.TABLE) {
-                    // Strong magenta fill + thick border for TABLE zones
                     g2.setComposite(java.awt.AlphaComposite.getInstance(java.awt.AlphaComposite.SRC_OVER, 0.30f));
                     g2.setColor(java.awt.Color.MAGENTA);
                     g2.fillRect(ml, zt, mr - ml, zh);
@@ -77,11 +72,9 @@ class B4Page09Test {
                     g2.setStroke(new java.awt.BasicStroke(3f));
                     g2.setColor(java.awt.Color.MAGENTA);
                     g2.drawRect(ml, zt, mr - ml, zh);
-                    // Draw bright red line at TABLE bottom for absolute clarity
                     g2.setColor(java.awt.Color.RED);
                     g2.setStroke(new java.awt.BasicStroke(5f));
                     g2.drawLine(0, z.yBottom(), passBands.getWidth(), z.yBottom());
-                    // Label the boundary
                     g2.setFont(new java.awt.Font("SansSerif", java.awt.Font.BOLD, 14));
                     g2.drawString("TABLE bottom = y=" + z.yBottom(), ml + 10, z.yBottom() - 8);
                     g2.setStroke(new java.awt.BasicStroke(1f));
@@ -97,14 +90,14 @@ class B4Page09Test {
             }
             g2.dispose();
 
-            String name = "B4-page09-bands-P" + (pi + 1) + ".png";
+            String name = "B4-page05-bands-P" + (pi + 1) + ".png";
             ImageIO.write(passBands, "PNG", OUTPUT_DIR.resolve(name).toFile());
             System.out.println("Wrote " + name + " (" + passes.get(pi).size() + " zones)");
         }
 
         // 3. Build layout PDF from zones
         int imgW = pageImage.getWidth(), imgH = pageImage.getHeight();
-        Path layoutPdf = OUTPUT_DIR.resolve("B4-page09-layout.pdf");
+        Path layoutPdf = OUTPUT_DIR.resolve("B4-page05-layout.pdf");
         try (PDDocument source = Loader.loadPDF(FIXTURE);
              PDDocument output = new PDDocument()) {
             PDPage srcPage = source.getPage(0);
@@ -127,7 +120,7 @@ class B4Page09Test {
                 }
             }
             output.save(layoutPdf.toFile());
-            System.out.println("Page 9 layout: " + layout.type()
+            System.out.println("Page 5 layout: " + layout.type()
                     + " -> " + output.getNumberOfPages() + " sub-pages");
         }
 
@@ -135,10 +128,10 @@ class B4Page09Test {
         PdfConverter converter = new PdfConverter();
         ConversionResult result = converter.convert(layoutPdf, "glossaries/B4.txt");
         markdown = result.markdown();
-        Files.writeString(OUTPUT_DIR.resolve("B4-page09.md"), markdown, StandardCharsets.UTF_8);
+        Files.writeString(OUTPUT_DIR.resolve("B4-page05.md"), markdown, StandardCharsets.UTF_8);
 
         // Debug
-        System.out.println("Page 9 layout type: " + layout.type());
+        System.out.println("Page 5 layout type: " + layout.type());
         System.out.println("Zones: " + layout.zones().size());
         for (int i = 0; i < layout.zones().size(); i++) {
             Zone z = layout.zones().get(i);
@@ -170,12 +163,12 @@ class B4Page09Test {
 
     @Test
     void bandsImageMatchesReference() throws Exception {
-        File refFile = new File("src/test/resources/B4-page09-bands-expected.png");
+        File refFile = new File("src/test/resources/B4-page05-bands-expected.png");
         org.junit.jupiter.api.Assumptions.assumeTrue(refFile.exists(),
-                "Reference bands image not found — copy test-output/B4-page09-bands.png to src/test/resources/B4-page09-bands-expected.png");
+                "Reference bands image not found — copy test-output/B4-page05-bands.png to src/test/resources/B4-page05-bands-expected.png");
 
         BufferedImage expected = ImageIO.read(refFile);
-        BufferedImage actual = ImageIO.read(OUTPUT_DIR.resolve("B4-page09-bands.png").toFile());
+        BufferedImage actual = ImageIO.read(OUTPUT_DIR.resolve("B4-page05-bands.png").toFile());
 
         assertEquals(expected.getWidth(), actual.getWidth(), "Bands image width mismatch");
         assertEquals(expected.getHeight(), actual.getHeight(), "Bands image height mismatch");
@@ -194,62 +187,32 @@ class B4Page09Test {
 
     @Test
     void markdownMatchesExpected() throws Exception {
-        Path expectedPath = Path.of("src/test/resources/B4-page09-expected.md");
+        Path expectedPath = Path.of("src/test/resources/B4-page05-expected.md");
         org.junit.jupiter.api.Assumptions.assumeTrue(expectedPath.toFile().exists(),
-                "Expected markdown not found — copy test-output/B4-page09.md to src/test/resources/B4-page09-expected.md");
+                "Expected markdown not found — copy test-output/B4-page05.md to src/test/resources/B4-page05-expected.md");
 
         String expected = Files.readString(expectedPath, StandardCharsets.UTF_8).strip();
         String actual = markdown.strip();
         assertEquals(expected, actual, "Markdown output differs from expected");
     }
 
-    // ── Layout structure — TABLE zone ───────────────────────────────────────
+    // ── Layout structure ───────────────────────────────────────────────────
 
     @Test
-    void hasTableZone() {
-        long tableZones = layout.zones().stream()
-                .filter(z -> z.type() == ZoneType.TABLE).count();
-        assertTrue(tableZones >= 1,
-                "Should have at least 1 TABLE zone for the wandering monster table");
+    void hasAtLeastOneZone() {
+        assertFalse(layout.zones().isEmpty(), "Should have at least one zone");
     }
 
     @Test
-    void hasTextZoneBelowTable() {
-        int tableBottom = layout.zones().stream()
-                .filter(z -> z.type() == ZoneType.TABLE)
-                .mapToInt(Zone::yBottom).max().orElse(-1);
-        assertTrue(tableBottom > 0, "Should have a TABLE zone");
-
-        long textZonesBelowTable = layout.zones().stream()
-                .filter(z -> z.type() == ZoneType.TEXT)
-                .filter(z -> z.yTop() >= tableBottom)
-                .count();
-        assertTrue(textZonesBelowTable >= 1,
-                "Should have at least 1 TEXT zone below the TABLE zone (table bottom=" + tableBottom + ")");
-    }
-
-    // ── Layout structure — TEXT zone ────────────────────────────────────────
-
-    @Test
-    void hasTextZoneWithTwoColumns() {
-        long twoColZones = layout.zones().stream()
-                .filter(z -> z.type() == ZoneType.TEXT)
-                .filter(z -> z.columns().size() == 2)
-                .count();
-        assertTrue(twoColZones >= 1,
-                "Should have at least 1 two-column TEXT zone below the table");
-    }
-
-    @Test
-    void tableZoneDoesNotOverlapTextZone() {
-        for (Zone table : layout.zones().stream()
-                .filter(z -> z.type() == ZoneType.TABLE).toList()) {
-            for (Zone text : layout.zones().stream()
-                    .filter(z -> z.type() == ZoneType.TEXT).toList()) {
-                boolean overlaps = table.yTop() < text.yBottom() && table.yBottom() > text.yTop();
+    void noZonesOverlap() {
+        var zones = layout.zones();
+        for (int i = 0; i < zones.size(); i++) {
+            for (int j = i + 1; j < zones.size(); j++) {
+                Zone a = zones.get(i), b = zones.get(j);
+                boolean overlaps = a.yTop() < b.yBottom() && a.yBottom() > b.yTop();
                 assertFalse(overlaps,
-                        "TABLE zone [" + table.yTop() + "," + table.yBottom()
-                                + ") overlaps TEXT zone [" + text.yTop() + "," + text.yBottom() + ")");
+                        "Zone " + i + " [" + a.yTop() + "," + a.yBottom()
+                                + ") overlaps Zone " + j + " [" + b.yTop() + "," + b.yBottom() + ")");
             }
         }
     }

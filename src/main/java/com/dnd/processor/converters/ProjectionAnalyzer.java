@@ -443,28 +443,270 @@ public class ProjectionAnalyzer {
      * own column detection, so a centred heading in one row cannot contaminate
      * the column gutter detection of the body row below it.
      */
+    /** Intermediate zone lists from each pass, for debug band rendering. */
+    private final List<List<Zone>> passZones = new ArrayList<>();
+
+    /** Returns the zone lists from each pass (P1, P1-retry, etc.) for debug rendering. */
+    List<List<Zone>> getPassZones() { return passZones; }
+
     private List<Zone> buildZones(boolean[] ink, int w, int h, Margins m,
                                    List<int[]> illZones) {
-        // ── Phase 1: find all row-splitting breaks ───────────────────────────
+        passZones.clear();
         int[] horizProj = horizontalProjection(ink, w, h, m.left(), m.right());
         int maxInkForRowGap = Math.max(1, (int)((m.right() - m.left()) * MAX_INK_FRACTION));
 
-        // Collect breaks: illustration zones (type=1 → IMAGE rows) and
-        // horizontal gaps (type=0 → whitespace separators, no row generated).
+        // ── Pass 1: initial Phase 1 + zone building ─────────────────────────
+        List<int[]> breaks = findPhase1Breaks(horizProj, m, illZones,
+                maxInkForRowGap, MIN_ROW_SPLIT_PX, List.of());
+        List<Zone> rows = buildZonesFromBreaks(ink, w, h, m, illZones, breaks);
+        passZones.add(List.copyOf(rows));
+        log.debug("[pass1] {} zones", rows.size());
+
+        // ── Check for TABLE zones → re-run Phase 1 if found ────────────────
+        // Collect table bounds from detected TABLE zones.  If any exist,
+        // re-run Phase 1 with (a) table regions protected from splitting and
+        // (b) a smaller gap threshold (MIN_HORIZ_GAP_PX) in the vicinity of
+        // the table so we can detect the table-to-text boundary precisely.
+        List<int[]> tableBounds = new ArrayList<>();
+        for (Zone z : rows) {
+            if (z.type() == ZoneType.TABLE) {
+                tableBounds.add(new int[]{z.yTop(), z.yBottom()});
+            }
+        }
+
+        if (!tableBounds.isEmpty()) {
+            log.debug("[table retry] found {} TABLE zones, re-running Phase 1",
+                    tableBounds.size());
+
+            List<int[]> breaks2 = new ArrayList<>(breaks);
+
+            for (int[] tb : tableBounds) {
+                // Remove any break inside the table OR adjacent to its boundary.
+                // Track the furthest removed break end so we can scan past it.
+                int adjacencyMargin = MIN_ROW_SPLIT_PX;
+                int removedEnd = tb[1]; // start scanning from at least here
+                breaks2.removeIf(brk -> {
+                    if (brk[2] == 1) return false;
+                    int brkMid = (brk[0] + brk[1]) / 2;
+                    boolean inside = brkMid >= tb[0] && brkMid < tb[1];
+                    boolean adjacent = brk[0] >= tb[1] && brk[0] < tb[1] + adjacencyMargin;
+                    if (inside || adjacent) {
+                        log.debug("[table protect] removed {} break [{},{}) near table [{},{})",
+                                inside ? "internal" : "adjacent", brk[0], brk[1], tb[0], tb[1]);
+                        return true;
+                    }
+                    return false;
+                });
+                // Scan in both directions from the detected TABLE zone,
+                // absorbing short content runs (additional table rows) until
+                // we hit dense paragraph text.
+                // A table row is short (< MIN_ROW_SPLIT_PX * 2 = ~80px) and has
+                // low ink density.  Paragraph text is taller and much denser.
+                int maxTableRowHeight = MIN_ROW_SPLIT_PX * 2;
+                int minTableRowHeight = MIN_HORIZ_GAP_PX; // ignore noise < 5px
+                float maxTableInkFrac = 0.12f;
+                float contentWidth = m.right() - m.left();
+
+                // ── Scan UPWARD from table top ──────────────────────────
+                int tableTopExtended = tb[0];
+                int cursor = tb[0];
+                while (cursor > m.top()) {
+                    // Find content run ending at or before cursor (scan backwards)
+                    int contentEnd = -1;
+                    for (int y = cursor - 1; y >= m.top(); y--) {
+                        if (horizProj[y] > maxInkForRowGap) { contentEnd = y + 1; break; }
+                    }
+                    if (contentEnd < 0) break;
+
+                    int contentStart = contentEnd;
+                    for (int y = contentEnd - 1; y >= m.top(); y--) {
+                        if (horizProj[y] <= maxInkForRowGap) { contentStart = y + 1; break; }
+                        contentStart = y;
+                    }
+
+                    int runHeight = contentEnd - contentStart;
+                    long runInkTotal = 0;
+                    for (int y = contentStart; y < contentEnd; y++) runInkTotal += horizProj[y];
+                    float avgInk = (float) runInkTotal / Math.max(1, runHeight);
+                    float inkFraction = avgInk / contentWidth;
+
+                    // Very short runs (< minTableRowHeight): horizontal rules
+                    // or noise pixels — skip over them and keep scanning.
+                    // Don't update tableTopExtended here — only real table rows
+                    // above should extend the boundary (short runs between them
+                    // will be included automatically).
+                    if (runHeight < minTableRowHeight) {
+                        log.debug("[table scan↑] content [{},{}) height={} inkFrac={} → skip (too short)",
+                                contentStart, contentEnd, runHeight, inkFraction);
+                        cursor = contentStart;
+                        continue;
+                    }
+
+                    // Check if text is centered (significant margins on both sides).
+                    // Centered text = table title row → include it but stop scanning.
+                    int leftmost = m.right(), rightmost = m.left();
+                    for (int y = contentStart; y < contentEnd; y++) {
+                        for (int x = m.left(); x < m.right(); x++) {
+                            if (ink[y * w + x]) {
+                                leftmost = Math.min(leftmost, x);
+                                rightmost = Math.max(rightmost, x + 1);
+                            }
+                        }
+                    }
+                    float leftMarginFrac = (float)(leftmost - m.left()) / contentWidth;
+                    float rightMarginFrac = (float)(m.right() - rightmost) / contentWidth;
+                    boolean isCentered = leftMarginFrac > 0.10f && rightMarginFrac > 0.10f;
+
+                    boolean looksLikeTableRow = runHeight < maxTableRowHeight && inkFraction < maxTableInkFrac;
+
+                    if (isCentered && looksLikeTableRow) {
+                        log.debug("[table scan↑] content [{},{}) height={} inkFrac={} leftM={} rightM={} → TITLE (stop)",
+                                contentStart, contentEnd, runHeight, inkFraction, leftMarginFrac, rightMarginFrac);
+                        tableTopExtended = contentStart;
+                        // Remove breaks in this region
+                        final int tcs = contentStart;
+                        breaks2.removeIf(brk -> {
+                            if (brk[2] == 1) return false;
+                            int mid = (brk[0] + brk[1]) / 2;
+                            return mid >= tcs && mid < tb[0];
+                        });
+                        break; // title found — stop scanning upward
+                    }
+
+                    log.debug("[table scan↑] content [{},{}) height={} avgInk={} inkFrac={} → {}",
+                            contentStart, contentEnd, runHeight, avgInk, inkFraction,
+                            looksLikeTableRow ? "table-row" : "NOT-table");
+
+                    if (!looksLikeTableRow) break;
+
+                    tableTopExtended = contentStart;
+                    // Remove breaks in this region
+                    final int cs = contentStart;
+                    breaks2.removeIf(brk -> {
+                        if (brk[2] == 1) return false;
+                        int mid = (brk[0] + brk[1]) / 2;
+                        return mid >= cs && mid < tb[0];
+                    });
+
+                    cursor = contentStart;
+                }
+
+                // Place break above the extended table top
+                if (tableTopExtended < tb[0]) {
+                    // Find the gap ending at tableTopExtended (scan backwards)
+                    int gapEnd = tableTopExtended;
+                    int gapStart = gapEnd;
+                    for (int y = gapEnd - 1; y >= m.top(); y--) {
+                        if (horizProj[y] > maxInkForRowGap) { gapStart = y + 1; break; }
+                        gapStart = y;
+                    }
+                    breaks2.add(new int[]{gapStart, gapEnd, 0});
+                    log.debug("[table boundary] placed break at [{},{}) above table [{},{})",
+                            gapStart, gapEnd, tb[0], tb[1]);
+                }
+
+                // ── Scan DOWNWARD from table bottom ─────────────────────
+                cursor = tb[1];
+                int lastGapEnd = -1;
+
+                while (cursor < m.bottom()) {
+                    // Skip gap pixels
+                    int contentStart = -1;
+                    for (int y = cursor; y < m.bottom(); y++) {
+                        if (horizProj[y] > maxInkForRowGap) { contentStart = y; break; }
+                    }
+                    if (contentStart < 0) break;
+
+                    // Find end of content run
+                    int contentEnd = contentStart;
+                    for (int y = contentStart; y < m.bottom(); y++) {
+                        if (horizProj[y] <= maxInkForRowGap) { contentEnd = y; break; }
+                        contentEnd = y + 1;
+                    }
+
+                    int runHeight = contentEnd - contentStart;
+                    long runInkTotal = 0;
+                    for (int y = contentStart; y < contentEnd; y++) runInkTotal += horizProj[y];
+                    float avgInk = (float) runInkTotal / Math.max(1, runHeight);
+                    float inkFraction = avgInk / contentWidth;
+
+                    // Very short runs: HRs or noise — skip
+                    if (runHeight < minTableRowHeight) {
+                        log.debug("[table scan↓] content [{},{}) height={} inkFrac={} → skip (too short)",
+                                contentStart, contentEnd, runHeight, inkFraction);
+                        lastGapEnd = contentEnd;
+                        cursor = contentEnd;
+                        continue;
+                    }
+
+                    boolean looksLikeTableRow = runHeight < maxTableRowHeight && inkFraction < maxTableInkFrac;
+                    log.debug("[table scan↓] content [{},{}) height={} avgInk={} inkFrac={} → {}",
+                            contentStart, contentEnd, runHeight, avgInk, inkFraction,
+                            looksLikeTableRow ? "table-row" : "NOT-table");
+
+                    if (!looksLikeTableRow) break;
+
+                    // Remove any existing breaks within this content run
+                    final int fce = contentEnd;
+                    breaks2.removeIf(brk -> {
+                        if (brk[2] == 1) return false;
+                        int mid = (brk[0] + brk[1]) / 2;
+                        return mid >= tb[1] && mid < fce + MIN_ROW_SPLIT_PX;
+                    });
+
+                    lastGapEnd = contentEnd;
+                    cursor = contentEnd;
+                }
+
+                // Place break below the extended table bottom
+                if (lastGapEnd >= 0) {
+                    int gapStart = lastGapEnd;
+                    int gapEnd = gapStart;
+                    for (int y = gapStart; y < m.bottom(); y++) {
+                        if (horizProj[y] > maxInkForRowGap) { gapEnd = y; break; }
+                        gapEnd = y + 1;
+                    }
+                    breaks2.add(new int[]{gapStart, gapEnd, 0});
+                    log.debug("[table boundary] placed break at [{},{}) below table [{},{})",
+                            gapStart, gapEnd, tb[0], tb[1]);
+                }
+            }
+
+            breaks2.sort((a, b) -> Integer.compare(a[0], b[0]));
+            rows = buildZonesFromBreaks(ink, w, h, m, illZones, breaks2);
+            passZones.add(List.copyOf(rows));
+            log.debug("[pass2] {} zones after table-aware re-run", rows.size());
+        }
+
+        return rows;
+    }
+
+    /**
+     * Phase 1: find all row-splitting horizontal breaks.
+     *
+     * @param horizProj       horizontal ink projection array
+     * @param m               page margins
+     * @param illZones        illustration zones (treated as IMAGE breaks)
+     * @param maxInkForRowGap ink threshold for gap detection
+     * @param minGapPx        minimum gap width to trigger a break
+     * @param protectedZones  y-ranges [top, bottom) where breaks are suppressed
+     *                        (e.g. detected table regions)
+     */
+    private List<int[]> findPhase1Breaks(int[] horizProj, Margins m,
+                                          List<int[]> illZones,
+                                          int maxInkForRowGap, int minGapPx,
+                                          List<int[]> protectedZones) {
         List<int[]> breaks = new ArrayList<>();
 
         for (int[] ill : illZones) {
             breaks.add(new int[]{ill[0], ill[1], 1});
         }
 
-        // Find row-splitting horizontal gaps in text regions between illustrations.
-        // After bridge merging, rescue any content swallowed inside a merged gap
-        // (e.g. a heading between two small gaps gets absorbed as a bridge).
         int current = m.top();
         for (int[] ill : illZones) {
             if (ill[0] > current) {
                 List<int[]> hGaps = findGaps(horizProj, current, ill[0],
-                        maxInkForRowGap, MIN_ROW_SPLIT_PX);
+                        maxInkForRowGap, minGapPx);
                 hGaps = rescueContentInGaps(hGaps, horizProj, maxInkForRowGap);
                 for (int[] g : hGaps) breaks.add(new int[]{g[0], g[1], 0});
             }
@@ -472,19 +714,42 @@ public class ProjectionAnalyzer {
         }
         if (current < m.bottom()) {
             List<int[]> hGaps = findGaps(horizProj, current, m.bottom(),
-                    maxInkForRowGap, MIN_ROW_SPLIT_PX);
+                    maxInkForRowGap, minGapPx);
             hGaps = rescueContentInGaps(hGaps, horizProj, maxInkForRowGap);
             for (int[] g : hGaps) breaks.add(new int[]{g[0], g[1], 0});
+        }
+
+        // Remove breaks that fall inside protected zones (table regions)
+        if (!protectedZones.isEmpty()) {
+            breaks.removeIf(brk -> {
+                if (brk[2] == 1) return false; // never remove IMAGE breaks
+                int brkMid = (brk[0] + brk[1]) / 2;
+                for (int[] pz : protectedZones) {
+                    if (brkMid >= pz[0] && brkMid < pz[1]) {
+                        log.debug("[table protect] removed break [{},{}) inside table [{},{})",
+                                brk[0], brk[1], pz[0], pz[1]);
+                        return true;
+                    }
+                }
+                return false;
+            });
         }
 
         breaks.sort((a, b) -> Integer.compare(a[0], b[0]));
         for (int[] brk : breaks) {
             log.debug("[phase1 break] [{},{}) type={}", brk[0], brk[1], brk[2] == 1 ? "IMAGE" : "GAP");
         }
+        return breaks;
+    }
 
-        // ── Phase 2: build rows from breaks ──────────────────────────────────
+    /**
+     * Phase 2: build zones from Phase 1 breaks.
+     * Includes IMAGE merging post-process.
+     */
+    private List<Zone> buildZonesFromBreaks(boolean[] ink, int w, int h, Margins m,
+                                             List<int[]> illZones, List<int[]> breaks) {
         List<Zone> rows = new ArrayList<>();
-        current = m.top();
+        int current = m.top();
         for (int[] brk : breaks) {
             if (brk[0] > current) {
                 rows.addAll(buildTextZoneWithHeaderSplit(ink, w, h, m, current, brk[0]));
@@ -522,47 +787,6 @@ public class ProjectionAnalyzer {
             } else {
                 i--;
             }
-        }
-
-        // Post-process: absorb trailing zones into a TABLE zone.
-        // Phase 1 bridge merging can split table rows into separate zones when
-        // the gap between rows exceeds MIN_ROW_SPLIT_PX.  Absorb the next zone
-        // if it starts with a short content run (a table row) followed by a gap.
-        for (i = 0; i < rows.size() - 1; i++) {
-            Zone tbl  = rows.get(i);
-            Zone next = rows.get(i + 1);
-            if (tbl.type() != ZoneType.TABLE || next.type() != ZoneType.TEXT) continue;
-
-            // Check if the next zone starts with a table-row-like pattern:
-            // a short content run (< MIN_ROW_SPLIT_PX) followed by a gap.
-            int nextTop = next.yTop(), nextBot = next.yBottom();
-            int[] nextHProj = horizontalProjection(ink, w, h, m.left(), m.right());
-            int maxInkNext = Math.max(1, (int)((m.right() - m.left()) * MAX_INK_FRACTION));
-
-            // Find the first gap in the next zone
-            List<int[]> nextGaps = findGaps(nextHProj, nextTop, nextBot, maxInkNext, MIN_HORIZ_GAP_PX);
-            if (nextGaps.isEmpty()) continue;
-
-            // The leading content run is from nextTop to the first gap
-            int firstRunHeight = nextGaps.get(0)[0] - nextTop;
-            if (firstRunHeight <= 0 || firstRunHeight >= MIN_ROW_SPLIT_PX) continue;
-
-            // The leading run looks like a table row. Split: absorb the row
-            // into the table and keep the rest as a separate zone.
-            int splitAt = nextGaps.get(0)[1]; // after the gap following the row
-            Zone combined = buildTextZone(ink, w, h, m, tbl.yTop(), splitAt);
-            rows.set(i, combined);
-            if (splitAt < nextBot) {
-                // Re-analyze the remainder
-                List<Zone> remainder = buildTextZoneWithHeaderSplit(ink, w, h, m, splitAt, nextBot);
-                rows.remove(i + 1);
-                rows.addAll(i + 1, remainder);
-            } else {
-                rows.remove(i + 1);
-            }
-            log.debug("[table absorb] absorbed row [{},{}) into TABLE → [{},{})",
-                    nextTop, splitAt, tbl.yTop(), splitAt);
-            i--; // re-check in case there are more trailing rows
         }
 
         return rows;
@@ -917,6 +1141,83 @@ public class ProjectionAnalyzer {
         return out;
     }
 
+    /**
+     * Renders band annotations for an arbitrary zone list onto a copy of the
+     * source image.  Used to visualize intermediate passes (P1, P1-retry, etc.).
+     */
+    public BufferedImage renderBands(BufferedImage src, Margins m, List<Zone> zoneList) {
+        int w = src.getWidth(), h = src.getHeight();
+        BufferedImage out = new BufferedImage(w, h, BufferedImage.TYPE_INT_RGB);
+        Graphics2D g2 = out.createGraphics();
+        g2.drawImage(src, 0, 0, null);
+        g2.setStroke(new BasicStroke(1f));
+
+        g2.setColor(Color.GREEN);
+        g2.drawRect(m.left(), m.top(), m.right() - m.left(), m.bottom() - m.top());
+
+        g2.setColor(Color.CYAN);
+        for (int ri = 0; ri + 1 < zoneList.size(); ri++) {
+            int gapTop = zoneList.get(ri).yBottom();
+            int gapBot = zoneList.get(ri + 1).yTop();
+            if (gapBot > gapTop) {
+                g2.drawRect(m.left(), gapTop, m.right() - m.left(), gapBot - gapTop);
+            } else {
+                g2.drawLine(m.left(), gapTop, m.right(), gapTop);
+            }
+        }
+
+        for (Zone zone : zoneList) {
+            int zt = zone.yTop(), zb = zone.yBottom(), zh = zb - zt;
+            if (zone.type() == ZoneType.IMAGE) {
+                g2.setColor(Color.ORANGE);
+                g2.drawRect(m.left(), zt, m.right() - m.left(), zh);
+            } else if (zone.type() == ZoneType.TABLE) {
+                g2.setColor(Color.MAGENTA);
+                g2.drawRect(m.left(), zt, m.right() - m.left(), zh);
+                g2.setColor(new Color(255, 105, 180));
+                for (Column col : zone.columns()) {
+                    for (ColumnZone cz : col.subZones()) {
+                        for (int[] gap : cz.horizGaps()) {
+                            g2.drawRect(col.xLeft(), gap[0],
+                                    col.xRight() - col.xLeft(), gap[1] - gap[0]);
+                        }
+                    }
+                }
+            } else {
+                List<Column> cols = zone.columns();
+                g2.setColor(Color.RED);
+                for (int k = 0; k + 1 < cols.size(); k++) {
+                    int gLeft  = cols.get(k).xRight();
+                    int gRight = cols.get(k + 1).xLeft();
+                    g2.drawRect(gLeft, zt, gRight - gLeft, zh);
+                }
+                g2.setColor(Color.YELLOW);
+                for (Column col : cols) {
+                    for (ColumnZone cz : col.subZones()) {
+                        if (cz.type() == ZoneType.IMAGE) {
+                            g2.drawRect(col.xLeft(), cz.yTop(),
+                                    col.xRight() - col.xLeft(), cz.yBottom() - cz.yTop());
+                        }
+                    }
+                }
+                g2.setColor(Color.BLUE);
+                for (Column col : cols) {
+                    for (ColumnZone cz : col.subZones()) {
+                        if (cz.type() == ZoneType.TEXT) {
+                            for (int[] gap : cz.horizGaps()) {
+                                g2.drawRect(col.xLeft(), gap[0],
+                                        col.xRight() - col.xLeft(), gap[1] - gap[0]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        g2.dispose();
+        return out;
+    }
+
     // ── Margin detection ──────────────────────────────────────────────────────
 
     public Margins detectMargins(int[] vertProj, int[] horizProj, int w, int h) {
@@ -1240,13 +1541,10 @@ public class ProjectionAnalyzer {
                 // Extend past last content run to include descenders / trailing pixels
                 int tableEnd   = Math.min(gap[1],
                         contentRuns.get(contentRuns.size() - 1)[1] + MIN_HORIZ_GAP_PX);
-                // Use MIN_ROW_SPLIT_PX for sub-gaps around table regions — small
-                // trailing gaps (e.g. 18px between last detected row and the next
-                // row) should not become Phase 1 breaks that split the table.
-                if (tableStart - gap[0] >= MIN_ROW_SPLIT_PX) {
+                if (tableStart - gap[0] >= MIN_HORIZ_GAP_PX) {
                     result.add(new int[]{gap[0], tableStart});
                 }
-                if (gap[1] - tableEnd >= MIN_ROW_SPLIT_PX) {
+                if (gap[1] - tableEnd >= MIN_HORIZ_GAP_PX) {
                     result.add(new int[]{tableEnd, gap[1]});
                 }
                 log.debug("[rescue table] {} content runs → single region [{},{}) in gap [{},{}). Runs: {}",

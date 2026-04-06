@@ -45,7 +45,7 @@ class ExtractTestPages {
 
         try (PDDocument doc = Loader.loadPDF(src)) {
             // Extract only new pages — existing fixtures should not be overwritten
-            extractPage(doc, 8, new File(outDir, "B4-page09.pdf"));
+            extractPage(doc, 16, new File(outDir, "B4-page17.pdf"));
         }
         System.out.println("Extracted test pages to " + outDir.getAbsolutePath());
     }
