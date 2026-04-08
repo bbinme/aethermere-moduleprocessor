@@ -148,6 +148,9 @@ public class DnD_BasicSet {
     /** Minimum whitespace gap width as a multiple of grid spacing for section detection. */
     public float minSectionGapFactor()     { return 2.0f; }
 
+    /** Brightness threshold (0–255) for floor/wall classification in grid extraction. */
+    public int floorThreshold()            { return 180; }
+
     // ── Illustration zone detection ───────────────────────────────────────────
 
     /**

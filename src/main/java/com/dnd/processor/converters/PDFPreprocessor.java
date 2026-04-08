@@ -689,11 +689,12 @@ public class PDFPreprocessor {
                 String fname = String.format("%s-page-%s-annotated.png", baseName, pageLabel);
                 javax.imageio.ImageIO.write(annotated, "PNG", outputDir.resolve(fname).toFile());
 
-                // Write section crops for grid maps
+                // Write section crops and extract grids for grid maps
                 if (result.type() == com.dnd.processor.model.MapType.GRID_MAP
                         && !result.sections().isEmpty()) {
-                    writeSectionCrops(img, layout.margins(), result, outputDir,
-                            baseName + "-page-" + pageLabel);
+                    String prefix = baseName + "-page-" + pageLabel;
+                    writeSectionCrops(img, layout.margins(), result, outputDir, prefix);
+                    extractGrids(img, layout.margins(), result, outputDir, prefix);
                 }
             }
             System.out.printf("Map detection complete: %d MAP pages analysed, output in %s%n",
@@ -801,6 +802,55 @@ public class PDFPreprocessor {
             BufferedImage crop = pageImage.getSubimage(x, y, bw, bh);
             String fname = String.format("%s-section%d.png", filePrefix, s + 1);
             javax.imageio.ImageIO.write(crop, "PNG", outputDir.resolve(fname).toFile());
+        }
+    }
+
+    /**
+     * Extracts floor/wall grids for each section of a grid map and writes
+     * DungeonMap JSON files + diagnostic overlay PNGs.
+     */
+    private void extractGrids(BufferedImage pageImage,
+                               ProjectionAnalyzer.Margins margins,
+                               com.dnd.processor.model.MapClassification result,
+                               Path outputDir, String filePrefix) throws IOException {
+        MapClassifier classifier = new MapClassifier(config);
+        var sectionBounds = classifier.computeSectionBounds(result, margins);
+        GridExtractor extractor = new GridExtractor(config.floorThreshold());
+        com.fasterxml.jackson.databind.ObjectMapper mapper =
+                new com.fasterxml.jackson.databind.ObjectMapper();
+
+        for (int s = 0; s < sectionBounds.size() && s < result.sections().size(); s++) {
+            int[] b = sectionBounds.get(s);
+            int x = Math.max(0, b[0]);
+            int y = Math.max(0, b[1]);
+            int bw = Math.min(b[2], pageImage.getWidth() - x);
+            int bh = Math.min(b[3], pageImage.getHeight() - y);
+            if (bw <= 0 || bh <= 0) continue;
+
+            BufferedImage crop = pageImage.getSubimage(x, y, bw, bh);
+            var section = result.sections().get(s);
+
+            com.dnd.processor.model.DungeonMap dungeon = extractor.extract(
+                    crop, section.widthSquares(), section.heightSquares(),
+                    result.gridSpacing());
+
+            // Write JSON
+            String jsonName = String.format("%s-section%d.json", filePrefix, s + 1);
+            mapper.writerWithDefaultPrettyPrinter()
+                    .writeValue(outputDir.resolve(jsonName).toFile(), dungeon);
+
+            // Write diagnostic overlay
+            BufferedImage overlay = extractor.renderOverlay(crop, dungeon, result.gridSpacing());
+            String overlayName = String.format("%s-section%d-grid.png", filePrefix, s + 1);
+            javax.imageio.ImageIO.write(overlay, "PNG", outputDir.resolve(overlayName).toFile());
+
+            // Console summary
+            long floorCount = 0;
+            for (int cell : dungeon.grid()) if (cell == 0) floorCount++;
+            int total = dungeon.width() * dungeon.height();
+            System.out.printf("  Section %d: %d×%d, floor: %.0f%%, wall: %.0f%%%n",
+                    s + 1, dungeon.width(), dungeon.height(),
+                    100.0 * floorCount / total, 100.0 * (total - floorCount) / total);
         }
     }
 
