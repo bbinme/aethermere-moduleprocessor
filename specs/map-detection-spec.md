@@ -234,20 +234,64 @@ Internal methods:
 - `List<Peak> findPeaks(double[] histogram)` — peak detection with merging
 - `MapType matchPattern(List<Peak> peaks)` — hex/grid/non-map classification
 - `double spacingRegularity(int[][] accumulator, double angle, int threshold)` — CV of line gaps
+- `List<MapSection> detectSections(BufferedImage cropped, double gridSpacing)` — content projection profile section detection
+- `boolean[] buildContentMask(BufferedImage image)` — grayscale threshold to content mask
+- `int[] horizontalProjection(boolean[] mask, int w, int h, int x1, int x2)` — content density per row
+- `int[] verticalProjection(boolean[] mask, int w, int h, int y1, int y2)` — content density per column
+- `List<int[]> findGaps(int[] projection, int extent, double densityThreshold, int minWidth)` — whitespace runs in a projection
 
 ---
 
-## Diagnostic Output
+## Visual Output
 
-The annotated PNG overlay for each MAP page should include:
+### Annotated overlay (diagnostic)
 
+One annotated PNG per MAP page for the user to visually verify detection results.
+Filename: `<module>-page<NN>-annotated.png`
+
+Contents:
 1. **Original page image** (dimmed to 40% opacity)
 2. **Detected Hough lines** — colour-coded by angle family:
    - Red: 0° ± tolerance
    - Green: 60° ± tolerance (or 90° for grid)
    - Blue: 120° ± tolerance
-3. **Classification label** in top-left corner: `HEX_MAP (0.82)` or `GRID_MAP (0.91)`
-4. **Angle histogram** rendered as a small bar chart in the bottom-right corner
+3. **Classification label** in top-left corner: `GRID_MAP (0.93)`
+4. **Section bounding boxes** — for multi-section pages, draw a distinct coloured
+   rectangle around each detected section's grid area. Use a rotating palette:
+   - Section 1: red
+   - Section 2: green
+   - Section 3: blue
+   - Section 4+: cycle
+   Each box has a label in its corner: `Section 1: 24×10`
+5. **Angle histogram** rendered as a small bar chart in the bottom-right corner
+
+### Section crops (for further processing)
+
+For each detected section in a `GRID_MAP`, output a separate cropped image
+containing just that section's grid area. These are full-resolution crops from the
+original page raster (not the dimmed overlay), suitable for downstream processing
+(VTT export, OCR of room labels, etc.).
+
+Filename: `<module>-page<NN>-section<S>.png`
+
+Examples for B4 page 31 (3 tiers):
+```
+B4-page31-annotated.png     ← full page with coloured bounding boxes
+B4-page31-section1.png      ← Tier 1 grid area only
+B4-page31-section2.png      ← Tier 2 grid area only
+B4-page31-section3.png      ← Tier 3 grid area only
+```
+
+For single-section pages (e.g., B4 page 33), only one section crop is produced:
+```
+B4-page33-annotated.png
+B4-page33-section1.png
+```
+
+Crop boundaries: Use the rho extent of the regular lines on both axes to define
+the bounding rectangle, padded by half a grid spacing on each side to include the
+outermost grid cell borders. Clamp to the content margins so the crop doesn't
+extend into page borders.
 
 ---
 
@@ -268,6 +312,241 @@ Add to the existing config record pattern:
 | `minRegularLines`      | 4       | Min parallel lines needed for spacing check    |
 | `cannyLowThreshold`    | 20      | Canny low threshold for map pages              |
 | `cannyHighThreshold`   | 60      | Canny high threshold for map pages             |
+
+---
+
+## Grid Dimensions (Size in Squares)
+
+For pages classified as `GRID_MAP`, compute the overall map size in grid squares
+(width × height). This tells us how large the dungeon map is, which is useful for
+downstream processing (e.g., VTT export, scaling calculations).
+
+### Approach
+
+The `analyseSpacing()` method already collects rho values of lines near each dominant
+angle and identifies the dominant grid spacing. To compute dimensions:
+
+1. **Track rho extent**: After clustering gaps and identifying the regularly-spaced
+   lines, compute the rho extent = `max(rho) - min(rho)` of only the lines whose
+   gaps matched the dominant spacing cluster (±20% tolerance). This excludes outlier
+   lines from wall edges or page borders that aren't part of the grid.
+
+2. **Compute dimension**: `extent / candidateSpacing` gives the number of grid
+   squares along that axis, rounded to the nearest integer.
+
+3. **Map the angles to width/height**:
+   - Lines at the **horizontal** angle (θ ≈ 0°) are horizontal lines — their rho
+     values measure vertical position → rho extent gives the **height** in squares
+   - Lines at the **vertical** angle (θ ≈ 90°) are vertical lines — their rho
+     values measure horizontal position → rho extent gives the **width** in squares
+
+### Data model changes
+
+Extend `SpacingResult` with a `rhoExtent` field:
+
+```java
+record SpacingResult(int regularLineCount, double candidateSpacing, double cv,
+                     double rhoExtent) {}
+```
+
+Extend `MapClassification` with grid dimensions:
+
+```java
+public record MapClassification(
+    MapType type,
+    double  confidence,
+    double[] dominantAngles,
+    double  gridSpacing,
+    int     gridWidthSquares,   // 0 if not GRID_MAP
+    int     gridHeightSquares   // 0 if not GRID_MAP
+) {}
+```
+
+### Angle-to-axis mapping
+
+The Hough convention `rho = x·cos(θ) + y·sin(θ)` means:
+- θ = 0° → cos=1, sin=0 → rho ≈ x → **vertical lines** → rho extent = **width**
+- θ = 90° → cos=0, sin=1 → rho ≈ y → **horizontal lines** → rho extent = **height**
+
+For a grid detected at rotation `r`:
+- Angle `r` (first family, e.g. 0°) → rho ≈ x → **width** axis
+- Angle `r + 90` (second family, e.g. 90°) → rho ≈ y → **height** axis
+
+### Edge cases
+
+- **Partial-coverage grids**: The rho extent only covers the portion of the page
+  where regularly-spaced grid lines were detected. For dungeon maps where the grid
+  doesn't span the full page, this gives the bounding box of the actual dungeon
+  content, which is the useful measurement.
+
+- **Non-grid maps**: `gridWidthSquares` and `gridHeightSquares` are 0 for
+  `HEX_MAP` and `NON_MAP` classifications.
+
+### Console output
+
+```
+Page 31: MAP → GRID_MAP  (score: 0.93, angles: 0°/90°, spacing: 37.0 px, grid: 24×32)
+```
+
+---
+
+## Multi-Level Detection
+
+Many classic D&D module pages pack multiple dungeon levels onto a single page.
+For example, B4 page 31 has Tiers 1 and 2 side-by-side in the upper half, with
+Tier 3 spanning the full width below — three separate dungeon maps with no
+connecting grid lines or corridors between them.
+
+### Goal
+
+Detect when a `GRID_MAP` page contains multiple distinct map sections (levels or
+locations) and report the count, individual dimensions, and pixel bounds of each.
+
+### Approach: Content projection profiles
+
+The previous approach attempted to find section breaks by looking for gaps in
+Hough rho values (line positions in parameter space). This is unreliable because:
+- Hough lines are **global** — rho is a 1D projection that loses spatial locality
+- Partial-coverage grids produce sparse, noisy rho values
+- Wall edges at similar rho values fill in gaps between tiers
+- Recovering 2D spatial separation from 1D frequency-domain parameters is fragile
+
+The better approach works **directly in image space**: once we know a page is a
+grid map, the tiers/levels are separated by **whitespace bands** visible in the
+pixel data. This is the same projection profile technique that `ProjectionAnalyzer`
+already uses for page margins and zone splitting.
+
+**Algorithm:**
+
+1. **Build content mask** from the cropped page image:
+   a. Convert to grayscale.
+   b. Threshold: any pixel with brightness < `CONTENT_THRESHOLD` (230) is "content."
+   c. This captures all map ink — walls, grid lines, solid fills, labels, legends.
+
+2. **Horizontal projection → row splits:**
+   a. For each row y, compute `density[y]` = (content pixels in row) / width.
+   b. Find consecutive runs where density < `GAP_DENSITY_THRESHOLD` (2%).
+   c. Discard runs narrower than `gridSpacing × MIN_SECTION_GAP_FACTOR` (2.0×).
+      This ensures only real tier separators qualify, not thin whitespace between
+      adjacent rooms.
+   d. The remaining runs are **horizontal section breaks**. They split the page
+      into horizontal bands.
+
+3. **Per-band vertical projection → column splits:**
+   a. For each horizontal band, compute a vertical projection restricted to that
+      band's y-range: for each column x, `density[x]` = (content pixels in column
+      within the band) / band_height.
+   b. Find consecutive runs where density < `GAP_DENSITY_THRESHOLD` (2%).
+   c. Discard runs narrower than `gridSpacing × MIN_SECTION_GAP_FACTOR` (2.0×).
+   d. The remaining runs are **vertical section breaks** within this band.
+   e. A vertical gap may exist in one band but not another — this is handled
+      naturally because each band's projection is computed independently.
+      (e.g., B4 p31: vertical gap between Tiers 1+2 in the top band, but no
+      gap in the full-width Tier 3 in the bottom band.)
+
+4. **Build sections**: Each (band, column) cell becomes a `MapSection` with:
+   - Pixel bounds (x, y, width, height) relative to the cropped content area,
+     taken directly from the band/column boundaries
+   - Grid dimensions (width/height in squares) computed by dividing the pixel
+     extent by gridSpacing from the Hough analysis
+
+### Why projection profiles are robust
+
+| Factor                  | Rho-gap approach (old)               | Projection approach (new)                |
+|-------------------------|--------------------------------------|------------------------------------------|
+| Works in                | Hough parameter space (indirect)     | Image pixel space (direct)               |
+| Partial-coverage grids  | Sparse, noisy rho values             | All ink contributes, not just grid lines |
+| Solid fills (blue walls)| Invisible (no grid lines inside fill)| Visible as content pixels                |
+| Labels / legends        | Noise in Hough space                 | Naturally included as content            |
+| Proven technique        | No                                   | Yes — ProjectionAnalyzer uses it already |
+
+The core advantage is directness: whitespace between tiers appears as a clear
+valley in the projection profile regardless of whether grid lines, walls, or
+fills are present. The rho-gap approach required grid lines to be detected first,
+then tried to infer spatial separation from their parameters — an inherently
+lossy transformation.
+
+### Minimum gap width
+
+The `MIN_SECTION_GAP_FACTOR` of 2.0× (= 1 empty grid square of whitespace) is
+lower than the previous 5.0× because the projection approach doesn't suffer from
+the same false-positive problem. With rho gaps, wall edges produced spurious large
+gaps that needed a high threshold to filter. With projection profiles, a whitespace
+band is unambiguous — if the density is below 2% across a strip wider than 2 grid
+squares, it's a real section break.
+
+Within a single dungeon level, there is no whitespace band this wide — even
+corridors and wide open areas contain wall outlines and grid lines that raise
+the content density well above 2%.
+
+### Data model
+
+```java
+record SpacingResult(
+    int regularLineCount,
+    double candidateSpacing,
+    double cv,
+    double rhoExtent
+) {}
+
+/**
+ * One distinct map section detected on the page.
+ * Pixel bounds are relative to the cropped content area.
+ */
+public record MapSection(
+    int widthSquares,
+    int heightSquares,
+    int pixelX,     // x-offset within cropped content area
+    int pixelY,     // y-offset within cropped content area
+    int pixelW,     // width in pixels
+    int pixelH      // height in pixels
+) {}
+
+public record MapClassification(
+    MapType type,
+    double  confidence,
+    double[] dominantAngles,
+    double  gridSpacing,
+    int     gridWidthSquares,    // total grid width (0 if not GRID_MAP)
+    int     gridHeightSquares,   // total grid height (0 if not GRID_MAP)
+    List<MapSection> sections    // individual map sections (1 if single map)
+) {}
+```
+
+### Configuration
+
+| Parameter               | Default | Description                                              |
+|-------------------------|---------|----------------------------------------------------------|
+| `minSectionGapFactor`   | 2.0     | Minimum whitespace gap width as multiple of grid spacing |
+| `contentThreshold`      | 230     | Brightness threshold (0–255) for content mask            |
+| `gapDensityThreshold`   | 0.02    | Max content density in a strip to qualify as a gap (2%)  |
+
+The 2.0× gap factor means a whitespace band must be at least 2 grid squares wide
+to qualify as a section break. This is sufficient because the projection approach
+identifies true whitespace (density < 2%) rather than rho-space gaps that could be
+caused by wall edges.
+
+### Console output
+
+Single map:
+```
+Page 33: MAP → GRID_MAP  (score: 0.95, spacing: 29.5 px, grid: 63×42, 1 section)
+```
+
+Multi-level:
+```
+Page 31: MAP → GRID_MAP  (score: 0.93, spacing: 37.0 px, grid: 44×38, 3 sections: 6×13, 15×13, 44×17)
+```
+
+### Test expectations
+
+| Page     | Expected sections | Notes                                       |
+|----------|-------------------|---------------------------------------------|
+| B4 p31   | 3                 | Tiers 1+2 side-by-side (top row), Tier 3 full-width (bottom row) |
+| B4 p32   | 1 or 2            | Tier 4 + legend (legend may not have grid)   |
+| B4 p33   | 1                 | Single Tier 5 dungeon                        |
+| B1 p02   | 1                 | Single dungeon level                         |
+| B1 p03   | 1                 | Single cave level (large internal gaps corroborated as walls) |
 
 ---
 

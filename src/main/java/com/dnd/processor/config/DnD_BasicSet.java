@@ -110,6 +110,44 @@ public class DnD_BasicSet {
      */
     public float mapImageZoneFraction() { return 0.50f; }
 
+    // ── Map classification (MapClassifier) ─────────────────────────────────────
+
+    /** Canny low threshold for map grid-line detection. */
+    public float mapCannyLowThreshold()    { return 20f; }
+
+    /** Canny high threshold for map grid-line detection. */
+    public float mapCannyHighThreshold()   { return 60f; }
+
+    /** Min Hough votes as fraction of min(width, height). */
+    public float houghVoteFraction()       { return 0.15f; }
+
+    /** Min normalized histogram value for an angle peak. */
+    public float minPeakStrength()         { return 0.25f; }
+
+    /** Degrees within which adjacent peaks are merged. */
+    public int peakMergeWindow()           { return 3; }
+
+    /** Angle tolerance for hex triplet matching (degrees). */
+    public int hexAngleTolerance()         { return 8; }
+
+    /** Angle tolerance for grid pair matching (degrees). */
+    public int gridAngleTolerance()        { return 8; }
+
+    /** Min peak strength for hex classification. */
+    public float minHexPeak()              { return 0.30f; }
+
+    /** Min peak strength for grid classification. */
+    public float minGridPeak()             { return 0.35f; }
+
+    /** Max coefficient of variation for regular grid spacing. */
+    public float maxSpacingCV()            { return 0.35f; }
+
+    /** Min parallel lines at a dominant angle to confirm a grid. */
+    public int minRegularLines()           { return 4; }
+
+    /** Minimum whitespace gap width as a multiple of grid spacing for section detection. */
+    public float minSectionGapFactor()     { return 2.0f; }
+
     // ── Illustration zone detection ───────────────────────────────────────────
 
     /**

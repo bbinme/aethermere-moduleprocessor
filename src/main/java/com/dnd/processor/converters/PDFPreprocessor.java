@@ -329,6 +329,86 @@ public class PDFPreprocessor {
      * @param outputDir directory to write annotated images into (created if absent)
      * @param dpi       render resolution (150 is a good starting point)
      */
+    public void analyzeZones(Path inputPath, Path outputDir, float dpi) throws IOException {
+        Files.createDirectories(outputDir);
+        String baseName = stripExtension(inputPath.getFileName().toString());
+        ProjectionAnalyzer analyzer = new ProjectionAnalyzer(config);
+
+        java.awt.Color[] zoneColors = {
+                java.awt.Color.RED, java.awt.Color.BLUE,
+                java.awt.Color.GREEN, new java.awt.Color(255, 140, 0),
+                java.awt.Color.MAGENTA, java.awt.Color.CYAN
+        };
+
+        try (PDDocument doc = Loader.loadPDF(inputPath.toFile())) {
+            PDFRenderer renderer = new PDFRenderer(doc);
+            int pageCount = doc.getNumberOfPages();
+            int digits = String.valueOf(pageCount).length();
+
+            for (int i = 0; i < pageCount; i++) {
+                BufferedImage page = renderer.renderImageWithDPI(i, dpi, ImageType.RGB);
+                ProjectionAnalyzer.PageLayout layout = analyzer.analyzeLayout(page);
+
+                BufferedImage overlay = new BufferedImage(
+                        page.getWidth(), page.getHeight(), BufferedImage.TYPE_INT_RGB);
+                java.awt.Graphics2D g = overlay.createGraphics();
+                g.drawImage(page, 0, 0, null);
+                g.setRenderingHint(java.awt.RenderingHints.KEY_ANTIALIASING,
+                        java.awt.RenderingHints.VALUE_ANTIALIAS_ON);
+
+                int ml = layout.margins().left(), mr = layout.margins().right();
+                for (int zi = 0; zi < layout.zones().size(); zi++) {
+                    ProjectionAnalyzer.Zone z = layout.zones().get(zi);
+                    java.awt.Color c = zoneColors[zi % zoneColors.length];
+                    int zt = z.yTop(), zb = z.yBottom();
+
+                    g.setComposite(java.awt.AlphaComposite.getInstance(
+                            java.awt.AlphaComposite.SRC_OVER, 0.15f));
+                    g.setColor(c);
+                    g.fillRect(ml, zt, mr - ml, zb - zt);
+
+                    g.setComposite(java.awt.AlphaComposite.getInstance(
+                            java.awt.AlphaComposite.SRC_OVER, 0.9f));
+                    g.setStroke(new java.awt.BasicStroke(3f));
+                    g.setColor(c);
+                    g.drawRect(ml, zt, mr - ml, zb - zt);
+
+                    g.setFont(new java.awt.Font("SansSerif", java.awt.Font.BOLD, 14));
+                    String label = "Z" + zi + " " + z.type()
+                            + " y=[" + zt + "," + zb + ") cols=" + z.columns().size();
+                    g.setColor(java.awt.Color.WHITE);
+                    g.fillRect(ml + 2, zt + 2, g.getFontMetrics().stringWidth(label) + 6, 18);
+                    g.setColor(c);
+                    g.drawString(label, ml + 5, zt + 16);
+
+                    g.setStroke(new java.awt.BasicStroke(2f, java.awt.BasicStroke.CAP_BUTT,
+                            java.awt.BasicStroke.JOIN_MITER, 10f, new float[]{6f, 4f}, 0f));
+                    for (ProjectionAnalyzer.Column col : z.columns()) {
+                        g.setColor(c.darker());
+                        g.drawLine(col.xLeft(), zt, col.xLeft(), zb);
+                        g.drawLine(col.xRight(), zt, col.xRight(), zb);
+                    }
+                }
+
+                g.setComposite(java.awt.AlphaComposite.getInstance(
+                        java.awt.AlphaComposite.SRC_OVER, 0.5f));
+                g.setColor(java.awt.Color.YELLOW);
+                g.setStroke(new java.awt.BasicStroke(1f, java.awt.BasicStroke.CAP_BUTT,
+                        java.awt.BasicStroke.JOIN_MITER, 10f, new float[]{4f, 4f}, 0f));
+                g.drawLine(ml, 0, ml, overlay.getHeight());
+                g.drawLine(mr, 0, mr, overlay.getHeight());
+                g.drawLine(0, layout.margins().top(), overlay.getWidth(), layout.margins().top());
+                g.drawLine(0, layout.margins().bottom(), overlay.getWidth(), layout.margins().bottom());
+                g.dispose();
+
+                String filename = String.format("%s-page-%0" + digits + "d-zones.jpg", baseName, i + 1);
+                ImageIO.write(overlay, "JPEG", outputDir.resolve(filename).toFile());
+                System.out.printf("  page %d/%d → %s  [%s, %d zones]%n",
+                        i + 1, pageCount, filename, layout.type(), layout.zones().size());
+            }
+        }
+    }
+
     public void analyzeBands(Path inputPath, Path outputDir, float dpi) throws IOException {
         Files.createDirectories(outputDir);
         String baseName = stripExtension(inputPath.getFileName().toString());
@@ -542,6 +622,186 @@ public class PDFPreprocessor {
 
         g.dispose();
         return out;
+    }
+
+    // ── Map classification diagnostic ──────────────────────────────────────────
+
+    /**
+     * Diagnostic phase: for each MAP page, runs MapClassifier and writes an
+     * annotated overlay PNG. Non-MAP pages are skipped.
+     */
+    public void classifyMaps(Path inputPath, Path outputDir, float dpi) throws IOException {
+        Files.createDirectories(outputDir);
+        String baseName = stripExtension(inputPath.getFileName().toString());
+
+        ProjectionAnalyzer analyzer = new ProjectionAnalyzer(config);
+        MapClassifier classifier = new MapClassifier(config);
+
+        try (PDDocument doc = Loader.loadPDF(inputPath.toFile())) {
+            PDFRenderer renderer = new PDFRenderer(doc);
+            int pageCount = doc.getNumberOfPages();
+            int digits = String.valueOf(pageCount).length();
+
+            int mapsFound = 0;
+            for (int i = 0; i < pageCount; i++) {
+                BufferedImage img = renderer.renderImageWithDPI(i, dpi, ImageType.RGB);
+                // Use raw layout — don't apply cover override so single-page
+                // fixtures and actual cover pages still get classified.
+                ProjectionAnalyzer.PageLayout layout = analyzer.analyzeLayout(img);
+
+                if (layout.type() != ProjectionAnalyzer.LayoutType.MAP) continue;
+
+                com.dnd.processor.model.MapClassification result =
+                        classifier.classify(img, layout.margins());
+                mapsFound++;
+
+                // Console summary
+                String anglesStr = "";
+                if (result.dominantAngles().length > 0) {
+                    StringBuilder sb = new StringBuilder();
+                    for (int a = 0; a < result.dominantAngles().length; a++) {
+                        if (a > 0) sb.append(", ");
+                        sb.append(String.format("%.0f°", result.dominantAngles()[a]));
+                    }
+                    anglesStr = ", angles: " + sb;
+                }
+                String gridStr = "";
+                if (result.gridWidthSquares() > 0 || result.gridHeightSquares() > 0) {
+                    gridStr = String.format(", grid: %d×%d", result.gridWidthSquares(), result.gridHeightSquares());
+                    if (result.sections().size() > 1) {
+                        StringBuilder sb = new StringBuilder();
+                        sb.append(String.format(", %d sections: ", result.sections().size()));
+                        for (int s = 0; s < result.sections().size(); s++) {
+                            if (s > 0) sb.append(", ");
+                            var sec = result.sections().get(s);
+                            sb.append(String.format("%d×%d", sec.widthSquares(), sec.heightSquares()));
+                        }
+                        gridStr += sb;
+                    }
+                }
+                System.out.printf("  Page %2d/%d: MAP → %-10s (confidence: %.2f, spacing: %.1f px%s%s)%n",
+                        i + 1, pageCount, result.type(), result.confidence(),
+                        result.gridSpacing(), anglesStr, gridStr);
+
+                // Write annotated overlay
+                String pageLabel = String.format("%0" + digits + "d", i + 1);
+                BufferedImage annotated = annotateMapPage(img, layout.margins(), result);
+                String fname = String.format("%s-page-%s-annotated.png", baseName, pageLabel);
+                javax.imageio.ImageIO.write(annotated, "PNG", outputDir.resolve(fname).toFile());
+
+                // Write section crops for grid maps
+                if (result.type() == com.dnd.processor.model.MapType.GRID_MAP
+                        && !result.sections().isEmpty()) {
+                    writeSectionCrops(img, layout.margins(), result, outputDir,
+                            baseName + "-page-" + pageLabel);
+                }
+            }
+            System.out.printf("Map detection complete: %d MAP pages analysed, output in %s%n",
+                    mapsFound, outputDir);
+        }
+    }
+
+    private BufferedImage annotateMapPage(BufferedImage src,
+                                           ProjectionAnalyzer.Margins margins,
+                                           com.dnd.processor.model.MapClassification result) {
+        int w = src.getWidth(), h = src.getHeight();
+        BufferedImage out = new BufferedImage(w, h, BufferedImage.TYPE_INT_RGB);
+        java.awt.Graphics2D g = out.createGraphics();
+
+        // Dim original image
+        g.drawImage(src, 0, 0, null);
+        g.setComposite(java.awt.AlphaComposite.getInstance(java.awt.AlphaComposite.SRC_OVER, 0.5f));
+        g.setColor(java.awt.Color.WHITE);
+        g.fillRect(0, 0, w, h);
+        g.setComposite(java.awt.AlphaComposite.SrcOver);
+
+        // Draw content margin box
+        g.setColor(java.awt.Color.GRAY);
+        g.setStroke(new java.awt.BasicStroke(1f));
+        g.drawRect(margins.left(), margins.top(),
+                margins.right() - margins.left(), margins.bottom() - margins.top());
+
+        // Classification label
+        java.awt.Color labelColor = switch (result.type()) {
+            case HEX_MAP  -> new java.awt.Color(0, 160, 0);
+            case GRID_MAP -> new java.awt.Color(0, 80, 200);
+            case NON_MAP  -> java.awt.Color.DARK_GRAY;
+        };
+
+        g.setFont(new java.awt.Font("SansSerif", java.awt.Font.BOLD, 18));
+        g.setColor(labelColor);
+        String label = String.format("%s (%.2f)", result.type(), result.confidence());
+        g.drawString(label, 10, 25);
+
+        // Spacing and dimensions info
+        if (result.gridSpacing() > 0) {
+            g.setFont(new java.awt.Font("SansSerif", java.awt.Font.PLAIN, 12));
+            String info = String.format("Grid spacing: %.1f px", result.gridSpacing());
+            if (result.gridWidthSquares() > 0 || result.gridHeightSquares() > 0) {
+                info += String.format("  |  %d × %d squares", result.gridWidthSquares(), result.gridHeightSquares());
+            }
+            if (result.sections().size() > 1) {
+                info += String.format("  |  %d sections", result.sections().size());
+            }
+            g.drawString(info, 10, 45);
+        }
+
+        // Draw section bounding boxes for multi-section grid maps
+        if (result.type() == com.dnd.processor.model.MapType.GRID_MAP
+                && result.sections().size() > 1) {
+            java.awt.Color[] palette = {
+                    new java.awt.Color(255, 0, 0, 180),
+                    new java.awt.Color(0, 180, 0, 180),
+                    new java.awt.Color(0, 80, 255, 180),
+                    new java.awt.Color(255, 160, 0, 180),
+                    new java.awt.Color(160, 0, 255, 180)
+            };
+            g.setStroke(new java.awt.BasicStroke(2.5f));
+            g.setFont(new java.awt.Font("SansSerif", java.awt.Font.BOLD, 14));
+
+            MapClassifier classifier = new MapClassifier(config);
+            var sectionBounds = classifier.computeSectionBounds(result, margins);
+
+            for (int s = 0; s < sectionBounds.size(); s++) {
+                java.awt.Color c = palette[s % palette.length];
+                g.setColor(c);
+                int[] b = sectionBounds.get(s); // [x, y, w, h]
+                g.drawRect(b[0], b[1], b[2], b[3]);
+
+                var sec = result.sections().get(s);
+                String secLabel = String.format("Section %d: %d×%d", s + 1,
+                        sec.widthSquares(), sec.heightSquares());
+                g.drawString(secLabel, b[0] + 4, b[1] + 16);
+            }
+        }
+
+        g.dispose();
+        return out;
+    }
+
+    /**
+     * Writes individual section crop images for a grid map.
+     */
+    private void writeSectionCrops(BufferedImage pageImage,
+                                    ProjectionAnalyzer.Margins margins,
+                                    com.dnd.processor.model.MapClassification result,
+                                    Path outputDir, String filePrefix) throws java.io.IOException {
+        MapClassifier classifier = new MapClassifier(config);
+        var sectionBounds = classifier.computeSectionBounds(result, margins);
+
+        for (int s = 0; s < sectionBounds.size(); s++) {
+            int[] b = sectionBounds.get(s); // [x, y, w, h]
+            // Clamp to image bounds
+            int x = Math.max(0, b[0]);
+            int y = Math.max(0, b[1]);
+            int bw = Math.min(b[2], pageImage.getWidth() - x);
+            int bh = Math.min(b[3], pageImage.getHeight() - y);
+            if (bw <= 0 || bh <= 0) continue;
+
+            BufferedImage crop = pageImage.getSubimage(x, y, bw, bh);
+            String fname = String.format("%s-section%d.png", filePrefix, s + 1);
+            javax.imageio.ImageIO.write(crop, "PNG", outputDir.resolve(fname).toFile());
+        }
     }
 
     /** Returns true for layout types that represent full-page images (excluded from margin summary). */
